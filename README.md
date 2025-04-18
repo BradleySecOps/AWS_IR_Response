@@ -19,6 +19,20 @@ I have put mutliple error checks, pre checks (of permissions) that occur prior t
 
 If you do find any issues with the logic or flow of this script, please let me know and happy to discuss or change.
 
+## Table of Contents
+
+* [Containment Strategy & Steps](#containment-strategy--steps)
+* [Project Structure](#project-structure)
+* [Configuration](#configuration)
+* [Required AWS Permissions & Rationale](#required-aws-permissions--rationale)
+* [Prerequisites](#prerequisites)
+* [How to Use the Script (Direct Execution)](#how-to-use-the-script-direct-execution)
+* [Optional: Setting up a Test Environment with Terraform](#optional-setting-up-a-test-environment-with-terraform)
+* [Limitations & Known Issues](#limitations--known-issues)
+* [Troubleshooting](#troubleshooting)
+* [Important Cleanup Steps (Manual)](#important-cleanup-steps-manual)
+* [License](#license)
+
 ## Containment Strategy & Steps
 
 The script employs a multi-optioned strategy to contain a potentially compromised EC2 instance. It guides the user through the following automated steps:
