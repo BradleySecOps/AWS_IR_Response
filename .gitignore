@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
+# Include the specific state file if not sensitive and needed for team collaboration,
+# but generally better to manage state remotely. For now, ignoring local state.
+# terraform.tfstate
+# terraform.tfstate.backup
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Local log files (if generated outside script timestamp naming)
+*.log
+
+# Local zip files
+*.zip
+
+# Word document backups (often created automatically)
+~$*.docx

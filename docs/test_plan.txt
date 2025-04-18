@@ -1,0 +1,165 @@
+==================================================
+Test Plan: AWS EC2 Instance Containment Script
+==================================================
+Version: 1.1
+Date: 2025-04-18
+
+--- Introduction ---
+This plan outlines testing for the AWS EC2 Instance Containment Script. It verifies the script's workflow for isolating instances, preserving evidence, and neutralizing threats in a controlled AWS test environment. Testing involves modifying AWS resources and requires appropriate permissions.
+
+--- Test Objectives ---
+- Verify successful execution of all script stages.
+- Validate user prompts, confirmations, and optional step handling.
+- Confirm correct creation/modification of AWS resources (NACLs, IAM Policies, Snapshots, etc.).
+- Ensure accurate logging and error handling.
+- Validate cleanup instructions.
+
+--- Test Environment ---
+- Dedicated AWS Test Account/VPC.
+- Test EC2 Instance (Linux/Windows) with IAM Role, EBS Volume(s). (Optional: IMDSv1 enabled, SSM Agent running).
+- Temporary AWS credentials with permissions from README.
+- Machine with Python 3, Boto3, Colorama.
+
+--- Test Execution Stages & Steps ---
+
+**Stage 1: Initialization & Setup**
+Objective: Verify script startup, logging, and credential handling.
+
+*   **Step 1.1:** Run `python containment_script.py`.
+    *   **Justification:** Initiates the script execution.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 1.2:** Verify log file creation (`containment_script_YYYYMMDD_HHMMSS.log`).
+    *   **Justification:** Ensures the logging mechanism is working and creating the audit trail file.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 1.3:** Verify script header display.
+    *   **Justification:** Confirms the user is presented with initial information about the script's purpose and warnings.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 1.4:** Enter AWS Credentials when prompted (Access Key, Secret Key, Session Token, Region).
+    *   **Justification:** Provides the necessary authentication details for the script to interact with AWS APIs. Test hidden input for secrets.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 1.5:** Test cancelling credential input (Ctrl+C).
+    *   **Justification:** Verifies graceful exit if the user cancels early.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 1.6:** Verify Boto3 session and client initialization.
+    *   **Justification:** Confirms the script can establish a connection to AWS services using the provided credentials. Test with invalid credentials.
+    *   **Result:** [ ] Pass / [ ] Fail (Valid Creds) | [ ] Pass / [ ] Fail (Invalid Creds)
+
+**Stage 2: Target Identification & Validation**
+Objective: Verify correct AWS account confirmation and target instance selection.
+
+*   **Step 2.1:** Verify Account ID and Alias display.
+    *   **Justification:** Ensures the script correctly identifies the AWS account associated with the credentials.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 2.2:** Confirm target account prompt (`yes/no`). Answer 'yes'.
+    *   **Justification:** Critical safety check to prevent accidental operations in the wrong account. Verifies the 'yes' path.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 2.3:** Test denying target account confirmation. Answer 'no'.
+    *   **Justification:** Verifies the script exits safely if the user indicates the wrong account.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 2.4:** Verify basic permission checks (`ec2:DescribeInstances`, `iam:ListRoles`).
+    *   **Justification:** Confirms initial checks for essential read permissions are performed. Test with missing permissions (non-critical like `iam:ListAccountAliases`, critical like `ec2:DescribeInstances`).
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 2.5:** Verify instance listing (`list_ec2_instances`).
+    *   **Justification:** Ensures the script can query and display available instances for the user to select from. Test with 0 and >0 instances.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 2.6:** Select target instance ID when prompted.
+    *   **Justification:** Confirms the user can select the specific instance to be contained. Test valid and invalid IDs. Test Ctrl+C.
+    *   **Result:** [ ] Pass / [ ] Fail (Valid ID) | [ ] Pass / [ ] Fail (Invalid ID)
+*   **Step 2.7:** Verify extraction of VPC ID and Subnet ID.
+    *   **Justification:** Confirms the script correctly identifies network details required for NACL containment.
+    *   **Result:** [ ] Pass / [ ] Fail
+
+**Stage 3: Pre-flight Checks**
+Objective: Verify preliminary checks for permissions and resource states before modifications.
+
+*   **Step 3.1:** Verify execution of `perform_preflight_checks`.
+    *   **Justification:** Ensures the pre-modification validation step runs.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 3.2:** Verify checks for Instance State, NACL perms, Termination Protection perms, IAM Role perms, EBS perms.
+    *   **Justification:** Confirms the script attempts to validate readiness for subsequent actions using non-mutating calls.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 3.3:** Test scenario with pre-flight check warnings (e.g., instance stopping). Confirm user prompt to continue. Answer 'yes'.
+    *   **Justification:** Validates handling of non-critical issues found during pre-flight.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 3.4:** Test scenario with pre-flight check warnings. Confirm user prompt to continue. Answer 'no'.
+    *   **Justification:** Validates the script exits if the user chooses not to proceed after warnings.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 3.5:** Test scenario with pre-flight check critical failure (e.g., missing core permission). Verify script exits.
+    *   **Justification:** Ensures the script stops execution if essential prerequisites are not met, preventing partial execution.
+    *   **Result:** [ ] Pass / [ ] Fail
+
+**Stage 4: Core Containment Actions**
+Objective: Verify network isolation and instance protection steps.
+
+*   **Step 4.1:** Verify NACL Containment (`apply_nacl_containment`). Check NACL creation, IPv4/IPv6 DENY rules, and subnet association.
+    *   **Justification:** Confirms the primary network isolation mechanism is applied correctly. Requires AWS Console verification.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 4.2:** Verify Termination Protection enablement (`enable_termination_protection`). Check instance attribute.
+    *   **Justification:** Confirms the instance is protected from accidental deletion. Requires AWS Console verification.
+    *   **Result:** [ ] Pass / [ ] Fail
+
+**Stage 5: Evidence Preservation & Context Gathering**
+Objective: Verify steps related to gathering instance context and preserving disk state.
+
+*   **Step 5.1:** Verify ASG Check (`check_autoscaling_groups`).
+    *   **Justification:** Confirms the script identifies and warns if the instance is part of an ASG.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.2:** Verify Load Balancer Check (`check_load_balancers`).
+    *   **Justification:** Confirms the script identifies and warns if the instance is behind an ELB/ALB/NLB.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.3:** Verify IMDS Version Check (`check_imds_version`).
+    *   **Justification:** Confirms the script checks and warns about insecure IMDSv1 configuration.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.4:** Verify Find Similar Instances (`find_instances_with_same_role`). (If role exists)
+    *   **Justification:** Confirms the script attempts to identify other potentially impacted instances based on the IAM role profile.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.5:** Verify Get Role Permissions (`get_role_permissions`). (If role exists)
+    *   **Justification:** Confirms the script lists the permissions associated with the instance's role for context.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.6:** Verify Offer/Revoke Role Sessions (`revoke_role_sessions`). (If role exists). Confirm prompt. Answer 'yes'. Check IAM policy.
+    *   **Justification:** Validates the critical step of neutralizing potentially compromised role credentials. Requires AWS Console verification.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.7:** Test declining Role Session Revocation. Answer 'no'.
+    *   **Justification:** Ensures the optional step can be skipped by the user.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.8:** Verify Get EBS Volume Sizes (`describe_and_update_volume_sizes`).
+    *   **Justification:** Confirms the script gathers disk size information needed for context/snapshotting.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.9:** Verify Offer/Snapshot EBS Volumes (`snapshot_ebs_volumes`). Confirm prompt. Answer 'yes'. Check snapshot creation/completion.
+    *   **Justification:** Validates the crucial evidence preservation step. Requires AWS Console verification.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 5.10:** Test declining EBS Volume Snapshotting. Answer 'no'.
+    *   **Justification:** Ensures the optional step can be skipped by the user.
+    *   **Result:** [ ] Pass / [ ] Fail
+
+**Stage 6: Final Actions & Reporting**
+Objective: Verify final instance state change, optional log collection, and reporting.
+
+*   **Step 6.1:** Verify Check SSM Agent Status (`_check_ssm_agent`).
+    *   **Justification:** Confirms the script checks SSM reachability *before* stopping the instance.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 6.2:** Verify Offer/Stop Instance (`stop_instance`). Confirm prompt. Answer 'yes'. Check instance state.
+    *   **Justification:** Validates the step to halt instance execution. Requires AWS Console verification.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 6.3:** Test declining Stop Instance. Answer 'no'.
+    *   **Justification:** Ensures the optional step can be skipped by the user.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 6.4:** Verify Offer/Collect Logs (`collect_and_upload_logs`). Confirm prompt. Answer 'yes'. Check S3 bucket creation, log/summary zip upload.
+    *   **Justification:** Validates the optional log aggregation and upload feature. Requires S3 verification. Test with/without findable CW Logs.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 6.5:** Test declining Log Collection. Answer 'no'.
+    *   **Justification:** Ensures the optional step can be skipped by the user.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 6.6:** Verify final completion summary and cleanup reminders are printed.
+    *   **Justification:** Confirms the user receives concluding information and necessary manual cleanup steps.
+    *   **Result:** [ ] Pass / [ ] Fail
+*   **Step 6.7:** Verify detailed execution log file content.
+    *   **Justification:** Ensures the log file provides a complete and accurate audit trail of the script's execution.
+    *   **Result:** [ ] Pass / [ ] Fail
+
+--- Pass/Fail Criteria ---
+- Pass: Step completes as expected, resources modified correctly, logs accurate, prompts correct.
+- Fail: Script crash, incorrect results, resources not modified correctly, inaccurate logs, incorrect prompt behavior, unexpected errors.
+
+--- Reporting ---
+Document results for each step, noting Pass/Fail status. For failures, include error messages, log snippets, and reproduction steps.

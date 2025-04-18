@@ -1,0 +1,74 @@
+graph TD
+    A[Start Script] --> B(Setup Logging);
+    B --> C{Get AWS Credentials};
+    C --> D{Initialize Boto3 Session};
+    D -- Success --> E{Validate Credentials & Confirm Account};
+    D -- Failure --> Exit_InitFail([Exit Script - Init Failure]);
+    E -- Account Confirmed & Validation OK --> F{List EC2 Instances};
+    E -- Account Denied / Critical Perms Missing --> Exit_ValidationFail([Exit Script - Validation Failure]);
+    F -- Instances Found --> G{Select Target Instance};
+    F -- No Instances Found --> Exit_NoInstances([Exit Script - No Instances]);
+    G -- Instance Selected --> H{Gather Preliminary Info - Role & Volumes};
+    G -- User Cancels --> Exit_UserCancel([Exit Script - User Cancelled]);
+    H --> I{Perform Pre-flight Checks};
+    I -- Critical Failure --> Exit_PreflightFail([Exit Script - Pre-flight Failed]);
+    I -- Warnings Found --> J{Continue Despite Warnings?};
+    I -- Success --> K(Execute Containment Actions);
+    J -- No --> Exit_PreflightWarn([Exit Script - User Declined Warnings]);
+    J -- Yes --> K;
+
+    subgraph Containment Actions
+        K --> L{Apply NACL Containment};
+        L --> M{Enable Termination Protection};
+        M --> N{Check ASG Membership};
+        N --> O{Check Load Balancer Membership};
+        O --> P{Check IMDS Version};
+        P --> Q{Role-Specific Actions?};
+        Q -- Role Exists --> R{Find Instances w/ Same Role};
+        Q -- No Role --> V(Skip Role Actions);
+        R --> S{Get Role Permissions};
+        S --> T{Offer/Revoke Role Sessions?};
+        T -- User Confirms Yes --> U(Apply Deny Policy);
+        T -- User Confirms No / Skipped --> V;
+        U --> V;
+        V --> W{Get EBS Volume Sizes};
+        W --> X{Offer/Snapshot EBS Volumes?};
+        X -- User Confirms Yes --> Y(Create/Wait Snapshots);
+        X -- User Confirms No / Skipped --> Z(Continue after Snapshots);
+        Y --> Z;
+        Z --> AA{Check SSM Agent Status};
+        AA --> BB{Offer/Stop Instance?};
+        BB -- User Confirms Yes --> CC(Stop Instance & Wait);
+        BB -- User Confirms No / Skipped --> DD(Continue after Stop Instance);
+        CC --> DD;
+    end
+
+    DD --> EE{Offer Log Collection?};
+    EE -- User Confirms Yes --> FF{Collect Logs & Action Summary};
+    EE -- User Confirms No / Skipped --> GG(Print Completion Summary);
+    FF -- Success / Partial --> HH{Upload Logs/Summary to S3};
+    FF -- Failure --> GG;
+    HH --> GG;
+    GG --> End([End Script]);
+
+    %% Define Styles (Optional)
+    classDef exit fill:#f9f,stroke:#333,stroke-width:2px;
+    class Exit_InitFail,Exit_ValidationFail,Exit_NoInstances,Exit_UserCancel,Exit_PreflightFail,Exit_PreflightWarn exit;
+```
+
+**Explanation of the Flowchart:**
+
+1.  **Start & Setup:** Initializes logging, gets credentials, sets up the AWS session. Exits if basic setup fails.
+2.  **Validation & Target:** Validates credentials, confirms the target AWS account, lists instances, and prompts for selection. Exits if validation fails, account is denied, or no instances are found.
+3.  **Pre-flight:** Gathers initial info (role, volumes) and runs checks. Exits if critical checks fail or if the user declines to proceed after warnings.
+4.  **Containment Actions (Subgraph):** Executes the core steps sequentially:
+    *   NACL application
+    *   Termination protection
+    *   Context checks (ASG, LB, IMDS)
+    *   Role-specific actions (find similar, get perms, offer revoke) - skipped if no role.
+    *   EBS actions (get size, offer snapshot)
+    *   SSM Agent status check
+    *   Offer to stop instance
+5.  **Log Collection:** Optionally attempts to collect CloudWatch logs and the action summary, package them, and upload to S3.
+6.  **Completion:** Prints the final summary and cleanup reminders.
+7.  **End:** Script finishes.

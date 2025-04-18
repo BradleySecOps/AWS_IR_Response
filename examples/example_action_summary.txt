@@ -1,0 +1,54 @@
+Containment Action Summary for Instance: i-0123456789abcdef0
+Report Generated: 2025-04-18T11:00:00.123456
+========================================
+Action: 00_ScriptStart
+  Status: Initiated
+  Details: Script started at 2025-04-18T10:59:55.123456
+--------------------
+Action: 03_ValidateCredentials
+  Status: Success
+  Details: Missing permissions: ['iam:ListAccountAliases (to display account name)']
+--------------------
+Action: 05a_GetEBSVolumes
+  Status: Info Gathered
+  Details: Found 1 EBS volume(s).
+--------------------
+Action: 05b_PreflightChecks
+  Status: Success
+  Details: Issues found: None
+--------------------
+Action: 06_NACLContainment
+  Status: Success
+  Details: Original NACL: acl-abcdef1234567890, Original Assoc: aclassoc-abcdef1234567890
+--------------------
+Action: 07_TerminationProtection
+  Status: Success
+--------------------
+Action: 12_FindSimilarInstances
+  Status: Skipped
+  Details: Skipping IAM role permission checks and session revocation as the specific IAM Role name could not be determined or no role is attached.
+--------------------
+Action: 13_GetRolePermissions
+  Status: Skipped
+  Details: Skipping IAM role permission checks and session revocation as the specific IAM Role name could not be determined or no role is attached.
+--------------------
+Action: 14_RevokeRoleSessions
+  Status: Skipped
+  Details: Skipping IAM role permission checks and session revocation as the specific IAM Role name could not be determined or no role is attached.
+--------------------
+Action: 17_SnapshotVolumes
+  Status: Attempted/Offered
+  Details: Check logs for user choice and snapshot IDs/status for volumes: ['vol-0abcdef123456789']
+--------------------
+Action: 18_CheckSSMAgent
+  Status: Offline/Error/NotManaged
+  Details: Check logs for details.
+--------------------
+Action: 19_StopInstance
+  Status: Attempted/Offered
+  Details: Check logs for user choice and outcome.
+--------------------
+Action: 20_LogCollection
+  Status: Attempted/Offered
+  Details: Check logs for user choice and outcome. Result: True
+--------------------
