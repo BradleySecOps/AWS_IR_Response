@@ -1092,21 +1092,26 @@ def perform_preflight_checks(session, instance_id, instance_details, vpc_id, ins
 
     # Check IAM Permissions (only if role exists)
     if instance_role_name:
-        print(f"  └── Checking IAM permissions for role '{instance_role_name}' via DryRun...")
+        # Note: iam:PutRolePolicy does not support DryRun.
+        # We can only check if the role exists, not the permission itself here.
+        # The actual permission check will happen if/when revoke_role_sessions is called.
+        print(f"  └── Checking if IAM role '{instance_role_name}' exists...")
         try:
-            # DryRun PutRolePolicy
-            iam.put_role_policy(RoleName=instance_role_name, PolicyName="dryrun-policy", PolicyDocument='{"Version":"2012-10-17","Statement":[]}', DryRun=True)
-            print(Fore.GREEN + f"    └── Basic IAM DryRun check passed (PutRolePolicy).")
+            # Check if role exists by trying to get it
+            iam.get_role(RoleName=instance_role_name)
+            print(Fore.GREEN + f"    └── IAM role '{instance_role_name}' found.")
         except ClientError as e:
-            if e.response['Error']['Code'] == 'DryRunOperation':
-                 print(Fore.GREEN + f"    └── Basic IAM DryRun check indicates permissions likely present for PutRolePolicy.")
-            elif e.response['Error']['Code'] == 'UnauthorizedOperation':
-                issue = f"Missing critical IAM permission iam:PutRolePolicy for role '{instance_role_name}'. Cannot revoke sessions. DryRun failed: {e}"
+            if e.response['Error']['Code'] == 'NoSuchEntity':
+                issue = f"IAM Role '{instance_role_name}' not found. Cannot perform role actions."
                 issues.append(issue)
-                # This might be considered a warning or critical depending on policy
-                print(Fore.YELLOW + f"    └── WARNING: {issue}") # Treat as warning for now
+                success = False # Treat as critical failure if role doesn't exist
+                print(Fore.RED + f"    └── CRITICAL: {issue}")
+            elif e.response['Error']['Code'] == 'AccessDenied':
+                 issue = f"Permission denied checking for IAM role '{instance_role_name}' (iam:GetRole)."
+                 issues.append(issue)
+                 print(Fore.YELLOW + f"    └── WARNING: {issue}") # Warning, might still have PutRolePolicy
             else:
-                issue = f"Potential issue during IAM permission DryRun check for role '{instance_role_name}': {e}. Proceed with caution."
+                issue = f"Error checking IAM role '{instance_role_name}': {e}."
                 issues.append(issue)
                 print(Fore.YELLOW + f"    └── WARNING: {issue}")
 

@@ -152,7 +152,7 @@ def main():
     # --- Pre-flight Checks ---
     logging.info("Starting pre-flight checks.")
     preflight_success, preflight_issues = perform_preflight_checks(
-        session, target_instance_id, target_instance_details, vpc_id, subnet_id, instance_role_name, attached_volumes
+        session, target_instance_id, target_instance_details, vpc_id, instance_role_name, attached_volumes
     )
     logging.info(f"Pre-flight checks completed. Success: {preflight_success}, Issues: {preflight_issues}")
     action_summary['05b_PreflightChecks'] = {'status': 'Success' if preflight_success else 'Failed', 'details': f"Issues found: {preflight_issues or 'None'}"}
