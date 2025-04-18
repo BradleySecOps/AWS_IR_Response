@@ -18,7 +18,7 @@ graph TD
     J -- Yes --> K;
 
     subgraph Containment Actions
-        K --> L{Apply NACL Containment};
+        K --> L{Apply Security Group Containment};
         L --> M{Enable Termination Protection};
         M --> N{Check ASG Membership};
         N --> O{Check Load Balancer Membership};
@@ -62,7 +62,7 @@ graph TD
 2.  **Validation & Target:** Validates credentials, confirms the target AWS account, lists instances, and prompts for selection. Exits if validation fails, account is denied, or no instances are found.
 3.  **Pre-flight:** Gathers initial info (role, volumes) and runs checks. Exits if critical checks fail or if the user declines to proceed after warnings.
 4.  **Containment Actions (Subgraph):** Executes the core steps sequentially:
-    *   NACL application
+    *   Security Group application
     *   Termination protection
     *   Context checks (ASG, LB, IMDS)
     *   Role-specific actions (find similar, get perms, offer revoke) - skipped if no role.

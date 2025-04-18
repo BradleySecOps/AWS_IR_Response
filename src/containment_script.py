@@ -25,7 +25,7 @@ from colorama import Fore, Style
 from .helpers import (print_header, print_status, get_aws_credentials,
                      select_target_instance)
 from .aws_interactions import (validate_credentials, list_ec2_instances,
-                              apply_nacl_containment, enable_termination_protection,
+                              apply_sg_containment, enable_termination_protection, # Changed NACL to SG
                               check_autoscaling_groups, check_load_balancers,
                               get_instance_role_info, check_imds_version,
                               find_instances_with_same_role, get_role_permissions,
@@ -34,7 +34,7 @@ from .aws_interactions import (validate_credentials, list_ec2_instances,
                               stop_instance, perform_preflight_checks,
                               collect_and_upload_logs, _check_ssm_agent) # Added imports
 # Import configuration constants (relative import)
-from .config import CONTAINMENT_NACL_NAME, DENY_POLICY_NAME
+from .config import CONTAINMENT_SG_NAME, DENY_POLICY_NAME # Changed NACL to SG
 
 # --- Logging Setup ---
 def setup_logging():
@@ -180,10 +180,11 @@ def main():
     print("\n" + Fore.CYAN + "--- Executing Containment Actions ---")
 
     # Step numbering adjusted for clarity after adding pre-flight
-    logging.info("Step 6: Applying NACL containment.")
-    nacl_success, orig_nacl, orig_assoc = apply_nacl_containment(ec2, vpc_id, subnet_id, target_instance_id)
-    action_summary['06_NACLContainment'] = {'status': 'Success' if nacl_success else 'Failed', 'details': f"Original NACL: {orig_nacl}, Original Assoc: {orig_assoc}"}
-    logging.info("Step 6: NACL containment function finished.")
+    logging.info("Step 6: Applying Security Group containment.")
+    # Call the new SG function, passing instance_details instead of subnet_id
+    sg_containment_success, original_sg_ids = apply_sg_containment(ec2, vpc_id, target_instance_id, target_instance_details)
+    action_summary['06_SGContainment'] = {'status': 'Success' if sg_containment_success else 'Failed', 'details': f"Containment SG '{CONTAINMENT_SG_NAME}' applied. Original SGs: {original_sg_ids}"}
+    logging.info("Step 6: Security Group containment function finished.")
 
     logging.info("Step 7: Enabling termination protection.")
     term_prot_success = enable_termination_protection(ec2, target_instance_id)
@@ -293,14 +294,16 @@ def main():
     print("-" * 70)
     print(Fore.YELLOW + Style.BRIGHT + "Cleanup Reminder:")
     # Construct cleanup messages for logging and printing
-    cleanup_nacl = f"- Manually review and delete the containment NACL ('{CONTAINMENT_NACL_NAME}') associated with subnet {subnet_id} once it's no longer needed."
+    # Updated cleanup message for Security Groups
+    original_sg_ids_str = ', '.join(original_sg_ids) if sg_containment_success else '(Check Logs/AWS Console)'
+    cleanup_sg = f"- Manually re-attach original Security Group(s) ({original_sg_ids_str}) to instance {target_instance_id} and delete the containment SG ('{CONTAINMENT_SG_NAME}') once no longer needed."
     cleanup_role = ""
     if instance_role_name: # Only remind about policy if role revocation was attempted
         cleanup_role = f"- Manually review and remove the inline policy ('{DENY_POLICY_NAME}') from IAM role '{instance_role_name}' after remediation."
     cleanup_term = "- Consider disabling termination protection if the instance needs to be terminated later."
 
-    logging.info("Cleanup Reminder:" + cleanup_nacl)
-    print(Fore.YELLOW + cleanup_nacl)
+    logging.info("Cleanup Reminder:" + cleanup_sg) # Use SG cleanup message
+    print(Fore.YELLOW + cleanup_sg) # Use SG cleanup message
     if cleanup_role:
         logging.info("Cleanup Reminder:" + cleanup_role)
         print(Fore.YELLOW + cleanup_role)

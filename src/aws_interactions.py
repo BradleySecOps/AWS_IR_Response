@@ -1,12 +1,13 @@
 import sys
 import time
+import logging
 from datetime import datetime
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError, WaiterError
 from colorama import Fore, Style
 
 # Import helper functions and configuration
-from helpers import print_status
-from config import CONTAINMENT_NACL_NAME, DENY_POLICY_NAME
+from .helpers import print_status
+from .config import CONTAINMENT_SG_NAME, DENY_POLICY_NAME # Updated import
 
 # --- AWS Interaction Functions ---
 
@@ -181,107 +182,126 @@ def list_ec2_instances(ec2_client):
         print_status(action, "error", f"An unexpected error occurred listing instances: {e}")
         return None
 
-def apply_nacl_containment(ec2_client, vpc_id, subnet_id, target_instance_id):
-    """Creates and applies a deny-all NACL to the instance's subnet."""
-    action = f"Applying NACL Containment ({CONTAINMENT_NACL_NAME})"
+# --- NEW FUNCTION: Apply Security Group Containment ---
+def apply_sg_containment(ec2_client, vpc_id, target_instance_id, instance_details):
+    """
+    Creates/finds an isolation Security Group and applies it exclusively
+    to the target instance, removing its existing SGs.
+    Returns tuple: (success_boolean, list_of_original_sg_ids)
+    """
+    action = f"Applying Security Group Containment ({CONTAINMENT_SG_NAME})"
     print_status(action, "pending")
-    original_nacl_association_id = None
-    original_nacl_id = None
+    containment_sg_id = None
+    original_sg_ids = [sg['GroupId'] for sg in instance_details.get('SecurityGroups', [])]
+    logging.info(f"Original Security Groups for {target_instance_id}: {original_sg_ids}")
 
     try:
-        # 1. Find the original NACL association for the target subnet
-        response = ec2_client.describe_network_acls(
-            Filters=[{'Name': 'association.subnet-id', 'Values': [subnet_id]}]
+        # 1. Check if the containment SG already exists in the VPC
+        print(f"  └── Checking for existing Security Group: {CONTAINMENT_SG_NAME}")
+        response_existing = ec2_client.describe_security_groups(
+            Filters=[
+                {'Name': 'vpc-id', 'Values': [vpc_id]},
+                {'Name': 'group-name', 'Values': [CONTAINMENT_SG_NAME]}
+            ]
         )
-        if not response.get('NetworkAcls'):
-            raise Exception(f"Could not find existing NACL for subnet {subnet_id}")
 
-        original_nacl = response['NetworkAcls'][0]
-        original_nacl_id = original_nacl['NetworkAclId']
-        # Find the specific association ID for the subnet
-        for assoc in original_nacl.get('Associations', []):
-            if assoc.get('SubnetId') == subnet_id:
-                original_nacl_association_id = assoc['NetworkAclAssociationId']
-                break
-        if not original_nacl_association_id:
-             raise Exception(f"Could not find NACL association ID for subnet {subnet_id}")
-
-        print(f"  └── Original NACL ID for subnet {subnet_id}: {original_nacl_id}")
-        print(f"  └── Original NACL Association ID: {original_nacl_association_id}")
-
-        # 2. Check if the containment NACL already exists in the VPC
-        existing_nacl_id = None
-        response_existing = ec2_client.describe_network_acls(
-             Filters=[
-                 {'Name': 'vpc-id', 'Values': [vpc_id]},
-                 {'Name': 'tag:Name', 'Values': [CONTAINMENT_NACL_NAME]}
-             ]
-        )
-        if response_existing.get('NetworkAcls'):
-            existing_nacl_id = response_existing['NetworkAcls'][0]['NetworkAclId']
-            print(f"  └── Found existing Containment NACL: {existing_nacl_id}")
-            containment_nacl_id = existing_nacl_id
+        if response_existing.get('SecurityGroups'):
+            containment_sg_id = response_existing['SecurityGroups'][0]['GroupId']
+            print(f"  └── Found existing Containment SG: {containment_sg_id}")
         else:
-            # 3. Create the new 'Containment NACL' if it doesn't exist
-            print(f"  └── Creating new NACL: {CONTAINMENT_NACL_NAME}")
-            nacl_response = ec2_client.create_network_acl(
+            # 2. Create the new 'Containment SG' if it doesn't exist
+            print(f"  └── Creating new Security Group: {CONTAINMENT_SG_NAME}")
+            sg_response = ec2_client.create_security_group(
+                GroupName=CONTAINMENT_SG_NAME,
+                Description=f"Isolation SG for Incident Response - Applied to {target_instance_id}",
                 VpcId=vpc_id,
-                TagSpecifications=[
-                    {
-                        'ResourceType': 'network-acl',
-                        'Tags': [{'Key': 'Name', 'Value': CONTAINMENT_NACL_NAME}]
-                    }
-                ]
+                TagSpecifications=[{
+                    'ResourceType': 'security-group',
+                    'Tags': [{'Key': 'Name', 'Value': CONTAINMENT_SG_NAME}]
+                }]
             )
-            containment_nacl_id = nacl_response['NetworkAcl']['NetworkAclId']
-            print(f"  └── Created Containment NACL ID: {containment_nacl_id}")
+            containment_sg_id = sg_response['GroupId']
+            print(f"  └── Created Containment SG ID: {containment_sg_id}")
 
-            # 4. Add deny rules (ingress and egress) to the new NACL
-            # Egress Deny Rule (Outbound traffic - IPv4)
-            ec2_client.create_network_acl_entry(
-                NetworkAclId=containment_nacl_id, RuleNumber=100, Protocol='-1', # All protocols
-                RuleAction='deny', Egress=True, CidrBlock='0.0.0.0/0'          # All IPv4 destinations
-            )
-            print(f"  └── Added Egress DENY ALL IPv4 rule (100) to {containment_nacl_id}")
-            # Egress Deny Rule (Outbound traffic - IPv6)
-            ec2_client.create_network_acl_entry(
-                NetworkAclId=containment_nacl_id, RuleNumber=101, Protocol='-1', # All protocols
-                RuleAction='deny', Egress=True, Ipv6CidrBlock='::/0'           # All IPv6 destinations
-            )
-            print(f"  └── Added Egress DENY ALL IPv6 rule (101) to {containment_nacl_id}")
+            # 3. Remove the default Egress rule (Allow All)
+            #    New SGs usually have a default allow-all egress rule. We need to remove it for isolation.
+            try:
+                print(f"  └── Revoking default egress rule from {containment_sg_id}")
+                # Describe to be sure about the default rule, though this is standard
+                sg_details = ec2_client.describe_security_groups(GroupIds=[containment_sg_id])
+                default_egress_rules = sg_details['SecurityGroups'][0].get('IpPermissionsEgress', [])
 
-            # Ingress Deny Rule (Inbound traffic - IPv4)
-            ec2_client.create_network_acl_entry(
-                NetworkAclId=containment_nacl_id, RuleNumber=100, Protocol='-1', # All protocols
-                RuleAction='deny', Egress=False, CidrBlock='0.0.0.0/0'         # All IPv4 sources
-            )
-            print(f"  └── Added Ingress DENY ALL IPv4 rule (100) to {containment_nacl_id}")
-            # Ingress Deny Rule (Inbound traffic - IPv6)
-            ec2_client.create_network_acl_entry(
-                NetworkAclId=containment_nacl_id, RuleNumber=101, Protocol='-1', # All protocols
-                RuleAction='deny', Egress=False, Ipv6CidrBlock='::/0'         # All IPv6 sources
-            )
-            print(f"  └── Added Ingress DENY ALL IPv6 rule (101) to {containment_nacl_id}")
+                if default_egress_rules:
+                     # Attempt to revoke the common default rule first
+                     try:
+                         ec2_client.revoke_security_group_egress(
+                             GroupId=containment_sg_id,
+                             IpPermissions=[{
+                                 'IpProtocol': '-1', # All protocols
+                                 'IpRanges': [{'CidrIp': '0.0.0.0/0'}], # All IPv4
+                                 'Ipv6Ranges': [],
+                                 'PrefixListIds': [],
+                                 'UserIdGroupPairs': []
+                             }]
+                         )
+                         print(f"  └── Successfully revoked default IPv4 egress rule.")
+                     except ClientError as revoke_err_ipv4:
+                         if revoke_err_ipv4.response['Error']['Code'] == 'InvalidPermission.NotFound':
+                             print(f"  └── Default IPv4 egress rule likely already removed or different.")
+                         else:
+                             raise revoke_err_ipv4 # Re-raise other errors
 
-        # 5. Associate the 'Containment NACL' with the subnet, replacing the original association
-        print(f"  └── Associating {containment_nacl_id} with subnet {subnet_id} (replacing association {original_nacl_association_id})")
-        replace_response = ec2_client.replace_network_acl_association(
-            AssociationId=original_nacl_association_id,
-            NetworkAclId=containment_nacl_id
+                     # Also attempt to revoke default IPv6 if present
+                     try:
+                         ec2_client.revoke_security_group_egress(
+                             GroupId=containment_sg_id,
+                             IpPermissions=[{
+                                 'IpProtocol': '-1', # All protocols
+                                 'IpRanges': [],
+                                 'Ipv6Ranges': [{'CidrIpv6': '::/0'}], # All IPv6
+                                 'PrefixListIds': [],
+                                 'UserIdGroupPairs': []
+                             }]
+                         )
+                         print(f"  └── Successfully revoked default IPv6 egress rule.")
+                     except ClientError as revoke_err_ipv6:
+                         if revoke_err_ipv6.response['Error']['Code'] == 'InvalidPermission.NotFound':
+                             print(f"  └── Default IPv6 egress rule likely already removed or different.")
+                         else:
+                             raise revoke_err_ipv6 # Re-raise other errors
+                else:
+                    print(f"  └── No default egress rules found to revoke (already isolated).")
+
+            except ClientError as revoke_err:
+                # Catch errors during revoke attempt
+                print_status(action, "warning", f"Could not revoke default egress rule from {containment_sg_id}: {revoke_err}. Manual check recommended.")
+                # Continue, as applying the SG is the main goal
+
+        # 4. Apply *only* the Containment SG to the instance
+        print(f"  └── Applying {containment_sg_id} exclusively to instance {target_instance_id}")
+        ec2_client.modify_instance_attribute(
+            InstanceId=target_instance_id,
+            Groups=[containment_sg_id] # This replaces existing SGs
         )
-        new_association_id = replace_response['NewAssociationId']
-        print(f"  └── New NACL Association ID: {new_association_id}")
+        print(f"  └── Instance {target_instance_id} is now associated ONLY with {containment_sg_id}")
 
         print_status(action, "complete")
-        # Return success and original NACL details for potential rollback (though rollback isn't implemented here)
-        return True, original_nacl_id, original_nacl_association_id
+        # Return success and original SG IDs for logging/rollback info
+        return True, original_sg_ids
 
     except ClientError as e:
-        print_status(action, "error", f"Failed during NACL operations: {e}")
-        return False, None, None
+        error_msg = f"Failed during Security Group operations: {e}"
+        print_status(action, "error", error_msg)
+        logging.error(f"{action} Error: {error_msg}", exc_info=True)
+        return False, original_sg_ids # Return original IDs even on failure
     except Exception as e:
-         print_status(action, "error", f"An unexpected error occurred during NACL ops: {e}")
-         return False, None, None
+        error_msg = f"An unexpected error occurred during SG ops: {e}"
+        print_status(action, "error", error_msg)
+        logging.error(f"{action} Error: {error_msg}", exc_info=True)
+        return False, original_sg_ids
+
+# --- END NEW FUNCTION ---
+
 
 def enable_termination_protection(ec2_client, instance_id):
     """Enables termination protection on the specified instance."""
@@ -499,1004 +519,956 @@ def find_instances_with_same_role(ec2_client, profile_arn, excluded_instance_id)
         print_status(action, "skipped", "No role profile ARN provided to check.")
         return []
 
-    instances_with_role = []
+    found_instances = []
     try:
         paginator = ec2_client.get_paginator('describe_instances')
-        # Filter instances directly by the IAM instance profile ARN
-        pages = paginator.paginate(Filters=[{'Name': 'iam-instance-profile.arn', 'Values': [profile_arn]}])
+        # Filter by instance profile ARN and state
+        pages = paginator.paginate(
+            Filters=[
+                {'Name': 'iam-instance-profile.arn', 'Values': [profile_arn]},
+                {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}
+            ]
+        )
 
+        print(f"  └── Searching for other instances using profile: {profile_arn.split('/')[-1]}")
         count = 0
         for page in pages:
             for reservation in page.get('Reservations', []):
                 for instance in reservation.get('Instances', []):
                     instance_id = instance['InstanceId']
-                    # Exclude the original target instance from the list
+                    # Exclude the instance we are currently containing
                     if instance_id != excluded_instance_id:
-                        # Only consider instances that are running or stopped
-                        if instance.get('State', {}).get('Name') in ['running', 'stopped']:
-                            instances_with_role.append(instance_id)
-                            count += 1
+                        instance_state = instance['State']['Name']
+                        instance_name = "N/A"
+                        if 'Tags' in instance:
+                            for tag in instance['Tags']:
+                                if tag['Key'] == 'Name':
+                                    instance_name = tag['Value']
+                                    break
+                        print(Fore.YELLOW + f"    - Found: ID: {instance_id}, Name: {instance_name}, State: {instance_state}")
+                        found_instances.append(instance_id)
+                        count += 1
 
-        if instances_with_role:
-             # Extract a display name for the profile from the ARN
-             profile_name_display = profile_arn.split('/')[-1] if '/' in profile_arn else profile_arn
-             print_status(action, "info", f"Found {count} other running/stopped instance(s) using the same profile ({profile_name_display}):")
-             for iid in instances_with_role:
-                 print(f"  - {iid}")
-             print(Fore.YELLOW + "  └── Consider if these instances might also be compromised or affected.")
+        if count == 0:
+            print(f"  └── No other running/stopped instances found using the same role profile.")
+            print_status(action, "info", "No other instances found with the same role.")
         else:
-            print_status(action, "info", "No other running/stopped instances found using this instance profile.")
+            print(Fore.YELLOW + f"  └── WARNING: Found {count} other instance(s) using the same IAM role. If the role credentials were compromised, these instances might also be affected or could be used for lateral movement.")
+            print_status(action, "warning", f"Found {count} other instance(s) with the same role.")
 
-        return instances_with_role
+        return found_instances
 
     except ClientError as e:
-        err_code = e.response.get("Error", {}).get("Code")
-        if err_code == 'AccessDenied':
-            msg = "Permission denied searching for instances by role profile ARN (ec2:DescribeInstances with filter)."
-        elif 'InvalidFilter' in err_code:
-            msg = f"Invalid filter used when searching instances by role profile ARN: {e}"
-        else:
-            msg = f"Could not search for instances by role profile ARN: {e}"
-        print_status(action, "error", msg)
+        print_status(action, "error", f"Failed to search for instances with the same role: {e}")
         return [] # Return empty list on error
     except Exception as e:
-         print_status(action, "error", f"An unexpected error occurred searching instances by role: {e}")
-         return []
+        print_status(action, "error", f"An unexpected error occurred searching for instances: {e}")
+        return []
 
 def get_role_permissions(iam_client, role_name):
     """Lists managed and inline policies attached to the specified IAM role."""
-    action = f"Getting Permissions for Role ({role_name})"
+    action = f"Getting Permissions for Role: {role_name}"
     print_status(action, "pending")
-    if not role_name:
-        print_status(action, "skipped", "No role name provided.")
-        return
-
     try:
-        print(f"  Permissions for role '{role_name}':")
-        policy_found = False
-
-        # List Managed Policies attached to the role
-        try:
-            attached_policies_paginator = iam_client.get_paginator('list_attached_role_policies')
-            managed_policy_count = 0
-            print("  └── Managed Policies:")
-            for page in attached_policies_paginator.paginate(RoleName=role_name):
-                 if page.get('AttachedPolicies'):
-                     for policy in page['AttachedPolicies']:
-                         print(f"      - {policy['PolicyName']} ({policy['PolicyArn']})")
-                         managed_policy_count += 1
-                         policy_found = True
-            if managed_policy_count == 0:
-                print("      (None found)")
-        except ClientError as e:
-             err_code = e.response.get("Error", {}).get("Code")
-             if err_code == 'NoSuchEntity': # Should not happen if role_name is valid, but check
-                  print(Fore.RED + f"      Error: Role '{role_name}' not found when listing managed policies.")
-             elif err_code == 'AccessDenied':
-                  print(Fore.RED + f"      Permission denied for iam:ListAttachedRolePolicies on role '{role_name}'.")
-             else:
-                  print(Fore.RED + f"      Error listing managed policies: {e}")
-
-        # List Inline Policies embedded in the role
-        try:
-            inline_policies_paginator = iam_client.get_paginator('list_role_policies')
-            inline_policy_count = 0
-            print("  └── Inline Policies:")
-            for page in inline_policies_paginator.paginate(RoleName=role_name):
-                 if page.get('PolicyNames'):
-                     for policy_name in page['PolicyNames']:
-                          print(f"      - {policy_name}")
-                          # To see the policy content, you'd need another call:
-                          # iam_client.get_role_policy(RoleName=role_name, PolicyName=policy_name)
-                          inline_policy_count += 1
-                          policy_found = True
-            if inline_policy_count == 0:
-                 print("      (None found)")
-        except ClientError as e:
-             err_code = e.response.get("Error", {}).get("Code")
-             if err_code == 'NoSuchEntity':
-                  print(Fore.RED + f"      Error: Role '{role_name}' not found when listing inline policies.")
-             elif err_code == 'AccessDenied':
-                  print(Fore.RED + f"      Permission denied for iam:ListRolePolicies on role '{role_name}'.")
-             else:
-                  print(Fore.RED + f"      Error listing inline policies: {e}")
-
-        if policy_found:
-            print_status(action, "complete")
+        # List Managed Policies
+        print(f"  └── Checking Managed Policies attached to role '{role_name}'...")
+        managed_policies = iam_client.list_attached_role_policies(RoleName=role_name).get('AttachedPolicies', [])
+        if managed_policies:
+            print(f"    Found {len(managed_policies)} Managed Policies:")
+            for policy in managed_policies:
+                print(f"      - Name: {policy['PolicyName']}, ARN: {policy['PolicyArn']}")
         else:
-            # If no policies were found and no errors occurred listing them
-            print_status(action, "info", f"No managed or inline policies listed for role '{role_name}'.")
+            print("    No Managed Policies found.")
 
-    except Exception as e: # Catch unexpected errors during the process
-         print_status(action, "error", f"An unexpected error occurred getting policies for role {role_name}: {e}")
+        # List Inline Policies
+        print(f"  └── Checking Inline Policies attached to role '{role_name}'...")
+        inline_policies = iam_client.list_role_policies(RoleName=role_name).get('PolicyNames', [])
+        if inline_policies:
+            print(f"    Found {len(inline_policies)} Inline Policies:")
+            for policy_name in inline_policies:
+                print(f"      - Name: {policy_name}")
+                # Optionally, you could get the policy document here too, but it can be large
+                # policy_doc = iam_client.get_role_policy(RoleName=role_name, PolicyName=policy_name)['PolicyDocument']
+                # print(f"        Document: {policy_doc}") # Be careful printing large docs
+        else:
+            print("    No Inline Policies found.")
+
+        print_status(action, "complete")
+
+    except ClientError as e:
+        # Handle common errors like NoSuchEntity or AccessDenied
+        if e.response['Error']['Code'] == 'NoSuchEntityException':
+             print_status(action, "error", f"IAM Role '{role_name}' not found.")
+        elif e.response['Error']['Code'] in ['AccessDenied', 'AccessDeniedException']:
+             print_status(action, "error", f"Permission denied to list policies for role '{role_name}'.")
+        else:
+             print_status(action, "error", f"Failed to get permissions for role '{role_name}': {e}")
+    except Exception as e:
+         print_status(action, "error", f"An unexpected error occurred getting role permissions: {e}")
 
 
 def revoke_role_sessions(iam_client, role_name):
     """
-    Applies a deny-all inline policy to the specified role to effectively
-    revoke active sessions using those credentials.
+    Applies a DENY ALL inline policy to the specified IAM role to revoke active sessions.
+    Prompts the user for confirmation before applying.
     """
-    action = f"Revoking Sessions for Role ({role_name})"
+    action = f"Revoking Active Sessions for Role: {role_name}"
+    print_status(action, "pending") # Initial status
 
-    if not role_name:
-        print_status(action, "skipped", "No role name provided to revoke sessions for.")
-        return
+    # Define the Deny All policy document
+    deny_policy_doc = """{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Deny",
+                "Action": "*",
+                "Resource": "*"
+            }
+        ]
+    }"""
 
-    print(f"\n{Fore.YELLOW}--- Revoke IAM Role Sessions ---")
-    print(f"This action will attach or overwrite an INLINE policy named '{DENY_POLICY_NAME}'")
-    print(f"to the role '{Fore.CYAN}{role_name}{Style.RESET_ALL}'. This policy denies all actions ('Action': '*', 'Resource': '*')")
-    print("effectively preventing any further use of temporary credentials obtained from this role.")
-    print(Fore.YELLOW + "This is a critical step if the role's credentials are suspected to be compromised.")
-    choice = input(f"Do you want to apply the '{DENY_POLICY_NAME}' policy to role '{role_name}'? (yes/no): ").lower().strip()
+    try:
+        # --- Confirmation Prompt ---
+        print("\n" + Fore.YELLOW + Style.BRIGHT + "--- Action Confirmation Needed ---")
+        print(f"You are about to apply a DENY ALL policy ('{DENY_POLICY_NAME}')")
+        print(f"to the IAM role: {Fore.CYAN}{role_name}{Style.RESET_ALL}")
+        print(Fore.YELLOW + "This will immediately invalidate any temporary credentials currently")
+        print(Fore.YELLOW + "associated with this role, effectively stopping its use.")
+        print(Fore.RED + Style.BRIGHT + "WARNING: This will affect ALL users/services/instances currently using this role.")
+        print("-" * 40)
+        confirm = input(f"Do you want to proceed with revoking sessions for role '{role_name}'? ({Fore.YELLOW}yes/no{Style.RESET_ALL}): ").lower().strip()
+        print("-" * 40)
 
-    if choice == 'yes':
-        print_status(action, "pending")
-        # Define the Deny All policy document
-        deny_policy_doc = """{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Deny",
-            "Action": "*",
-            "Resource": "*"
-        }
-    ]
-}"""
-        try:
-            # Use put_role_policy: creates the policy if it doesn't exist, overwrites it if it does.
+        if confirm == 'yes':
+            print(f"  └── Applying DENY ALL policy '{DENY_POLICY_NAME}' to role '{role_name}'...")
             iam_client.put_role_policy(
                 RoleName=role_name,
                 PolicyName=DENY_POLICY_NAME,
                 PolicyDocument=deny_policy_doc
             )
-            print_status(action, "complete", f"Applied '{DENY_POLICY_NAME}' deny policy to role '{role_name}'. Active sessions using this role should now be blocked.")
-        except ClientError as e:
-            err_code = e.response.get("Error", {}).get("Code")
-            if err_code == 'NoSuchEntity':
-                 msg = f"Role '{role_name}' not found. Cannot apply deny policy."
-            elif err_code == 'AccessDenied':
-                 msg = f"Permission denied for iam:PutRolePolicy on role '{role_name}'."
-            elif err_code == 'LimitExceeded':
-                  msg = f"Cannot add inline policy '{DENY_POLICY_NAME}'. Role '{role_name}' may already have the maximum number of inline policies."
-            elif err_code == 'MalformedPolicyDocument':
-                 # This shouldn't happen with the hardcoded policy, but check anyway
-                 msg = f"The generated Deny All policy document is invalid."
-            else:
-                msg = f"Failed to apply deny policy to role {role_name}: {e}"
-            print_status(action, "error", msg)
-        except Exception as e:
-            print_status(action, "error", f"An unexpected error occurred applying deny policy: {e}")
+            success_msg = f"Successfully applied '{DENY_POLICY_NAME}' to role '{role_name}'. Active sessions should now be invalid."
+            print(Fore.GREEN + f"  └── {success_msg}")
+            print_status(action, "complete", success_msg)
+            logging.info(f"User confirmed. Applied Deny policy {DENY_POLICY_NAME} to role {role_name}.")
+        else:
+            skip_msg = f"User chose NOT to apply DENY policy to role '{role_name}'. Sessions remain active."
+            print(Fore.YELLOW + f"  └── {skip_msg}")
+            print_status(action, "skipped", skip_msg)
+            logging.warning(f"User skipped applying Deny policy to role {role_name}.")
 
-    else:
-        print_status(action,"warning", f"Session revocation SKIPPED for role {role_name}.")
-        print(Fore.RED + Style.BRIGHT + "  └── WARNING: If compromise is suspected, it is HIGHLY RECOMMENDED to revoke sessions to prevent further unauthorized actions.")
+    except ClientError as e:
+        # Handle common errors like NoSuchEntity or AccessDenied
+        if e.response['Error']['Code'] == 'NoSuchEntityException':
+             error_msg = f"IAM Role '{role_name}' not found. Cannot apply policy."
+        elif e.response['Error']['Code'] in ['AccessDenied', 'AccessDeniedException', 'UnrecognizedClientException']:
+             error_msg = f"Permission denied to apply policy (iam:PutRolePolicy) to role '{role_name}'."
+        elif e.response['Error']['Code'] == 'MalformedPolicyDocument':
+             error_msg = f"The generated DENY policy document is invalid. This is unexpected. Error: {e}"
+        elif e.response['Error']['Code'] == 'LimitExceeded':
+             error_msg = f"Cannot apply policy: Inline policy limit reached for role '{role_name}'. Error: {e}"
+        else:
+             error_msg = f"Failed to apply DENY policy to role '{role_name}': {e}"
+        print_status(action, "error", error_msg)
+        logging.error(f"{action} Error: {error_msg}", exc_info=True)
+    except Exception as e:
+         error_msg = f"An unexpected error occurred during role session revocation: {e}"
+         print_status(action, "error", error_msg)
+         logging.error(f"{action} Error: {error_msg}", exc_info=True)
+
 
 def get_ebs_volumes(instance_details):
-    """Gets EBS volume information attached to the instance from its details."""
+    """Extracts EBS volume IDs and attachment info from instance details."""
     action = "Getting Attached EBS Volumes"
     print_status(action, "pending")
-    volumes = [] # List to store dicts like {'VolumeId': 'vol-..', 'DeviceName': '/dev/..', 'SizeGB': None}
-    block_device_mappings = instance_details.get('BlockDeviceMappings', [])
-
-    if not block_device_mappings:
+    volumes = []
+    block_devices = instance_details.get('BlockDeviceMappings', [])
+    if not block_devices:
         print_status(action, "info", "No block device mappings found for the instance.")
-        return []
+        return volumes # Return empty list
 
-    print("  Attached EBS Volumes:")
-    for mapping in block_device_mappings:
-        # Check if the mapping is for an EBS volume and has a VolumeId
-        if 'Ebs' in mapping and 'VolumeId' in mapping['Ebs']:
-            volume_id = mapping['Ebs']['VolumeId']
-            device_name = mapping.get('DeviceName', 'N/A') # Get device name if available
-            # Size will be fetched in a separate step
-            volumes.append({'VolumeId': volume_id, 'DeviceName': device_name, 'SizeGB': None})
-            print(f"  - Volume ID: {volume_id}, Device: {device_name}")
-        else:
-             # Log if a mapping exists but isn't for a standard EBS volume
-             device_name = mapping.get('DeviceName', 'N/A')
-             print(f"  - Non-EBS or incomplete mapping found for device: {device_name}")
+    for device in block_devices:
+        if 'Ebs' in device and 'VolumeId' in device['Ebs']:
+            volume_id = device['Ebs']['VolumeId']
+            device_name = device.get('DeviceName', 'N/A')
+            print(f"  └── Found EBS Volume: ID: {volume_id}, Attached as: {device_name}")
+            volumes.append({'VolumeId': volume_id, 'DeviceName': device_name})
 
     if not volumes:
-        print_status(action, "info", "No EBS volumes identified in block device mappings.")
-        return []
+         print_status(action, "info", "No EBS volumes found in block device mappings.")
     else:
-        print_status(action, "complete")
-        return volumes
+         print_status(action, "complete", f"Found {len(volumes)} EBS volume(s).")
+    return volumes
 
 
 def describe_and_update_volume_sizes(ec2_client, volumes):
     """
-    Takes a list of volume dicts (from get_ebs_volumes), fetches their sizes
-    using ec2:DescribeVolumes, and updates the 'SizeGB' key in the dicts.
-    Returns the updated list.
+    Gets the size for each volume ID in the list and updates the list.
+    Handles potential errors if a volume is not found (e.g., deleted).
     """
-    if not volumes:
-        return volumes # Return immediately if the list is empty
-
     action = "Getting EBS Volume Sizes"
     print_status(action, "pending")
-    volume_ids = [v['VolumeId'] for v in volumes if v.get('VolumeId')] # Get valid volume IDs
-    if not volume_ids:
-         print_status(action, "skipped", "No valid volume IDs to describe.")
-         return volumes # Return original list if no IDs
+    if not volumes:
+        print_status(action, "skipped", "No volumes provided to describe.")
+        return []
 
-    # Create a copy to modify, preserving the original list structure
-    updated_volumes = [v.copy() for v in volumes]
+    volume_ids = [v['VolumeId'] for v in volumes]
+    updated_volumes = [] # Create a new list for updated info
 
     try:
-        # Call describe_volumes for all volumes at once
         response = ec2_client.describe_volumes(VolumeIds=volume_ids)
-        # Create a mapping from VolumeId to Size for easy lookup
-        size_map = {vol['VolumeId']: vol.get('Size') for vol in response.get('Volumes', [])}
+        volume_details_map = {vol['VolumeId']: vol for vol in response.get('Volumes', [])}
 
-        all_found = True
-        print("  Volume sizes:")
-        for v in updated_volumes:
-            vol_id = v.get('VolumeId')
-            if vol_id: # Process only if VolumeId exists
-                size_gb = size_map.get(vol_id)
-                if size_gb is not None:
-                     v['SizeGB'] = size_gb
-                     print(f"   - {v['VolumeId']} ({v.get('DeviceName', 'N/A')}): {v['SizeGB']} GB")
-                else:
-                     # Size wasn't found in the response (volume might have been deleted?)
-                     v['SizeGB'] = 'Unknown'
-                     all_found = False
-                     print(Fore.YELLOW + f"  └── Warning: Could not determine size for volume {vol_id}")
+        processed_count = 0
+        for vol_info in volumes: # Iterate through the original list
+            vol_id = vol_info['VolumeId']
+            if vol_id in volume_details_map:
+                size_gb = volume_details_map[vol_id].get('Size', 'Unknown')
+                print(f"  └── Volume: {vol_id}, Size: {size_gb} GiB")
+                # Add size to the original dictionary and append to new list
+                vol_info['SizeGiB'] = size_gb
+                updated_volumes.append(vol_info)
+                processed_count += 1
             else:
-                 v['SizeGB'] = 'N/A' # Mark as N/A if no VolumeId initially
+                print(Fore.YELLOW + f"  └── Warning: Could not find details for volume {vol_id}. It might have been deleted.")
+                # Append original info but mark size as unknown
+                vol_info['SizeGiB'] = 'Not Found'
+                updated_volumes.append(vol_info)
 
-        if all_found:
+        if processed_count == len(volumes):
             print_status(action, "complete")
+        elif processed_count > 0:
+             print_status(action, "warning", "Could not retrieve size for all volumes.")
         else:
-             print_status(action, "warning", "Could not determine size for one or more volumes.")
+             print_status(action, "error", "Failed to retrieve size for any provided volumes.")
 
         return updated_volumes
 
     except ClientError as e:
-        err_code = e.response.get("Error", {}).get("Code")
-        if err_code == 'AccessDenied':
-            msg = "Permission denied for ec2:DescribeVolumes. Sizes will remain unknown."
-        elif 'InvalidVolume.NotFound' in str(e):
-             msg = "One or more specified volume IDs not found during size lookup. Sizes may be incomplete."
+        # Handle cases where some volumes might not be found or access denied
+        if 'InvalidVolume.NotFound' in str(e):
+             print_status(action, "warning", f"Some volumes were not found during size check: {e}")
+             # Attempt to return partial results if possible by adding 'Not Found'
+             for vol_info in volumes:
+                 if 'SizeGiB' not in vol_info: # If not already processed
+                     vol_info['SizeGiB'] = 'Error/Not Found'
+                     updated_volumes.append(vol_info)
+             return updated_volumes
+        elif e.response['Error']['Code'] in ['AccessDenied', 'AccessDeniedException']:
+             print_status(action, "error", f"Permission denied to describe volumes: {e}")
         else:
-            msg = f"Could not describe volumes to get sizes: {e}. Sizes will remain unknown."
-        print_status(action, "error", msg)
-        # Mark sizes as 'Error' in the list before returning
-        for v in updated_volumes: v['SizeGB'] = 'Error'
+             print_status(action, "error", f"Failed to describe volume sizes: {e}")
+        # Return the original list but mark all as unknown size on error
+        for vol_info in volumes:
+            vol_info['SizeGiB'] = 'Error'
+            updated_volumes.append(vol_info)
         return updated_volumes
     except Exception as e:
-         print_status(action, "error", f"An unexpected error occurred getting volume sizes: {e}. Sizes will remain unknown.")
-         for v in updated_volumes: v['SizeGB'] = 'Error'
+         print_status(action, "error", f"An unexpected error occurred getting volume sizes: {e}")
+         for vol_info in volumes:
+            vol_info['SizeGiB'] = 'Error'
+            updated_volumes.append(vol_info)
          return updated_volumes
 
 
 def snapshot_ebs_volumes(ec2_client, volumes, instance_id):
     """
-    Offers to snapshot the provided list of EBS volumes. Creates snapshots
-    with descriptive tags and waits for them to complete.
+    Creates snapshots for the specified EBS volumes.
+    Prompts the user for confirmation before snapshotting.
+    Waits for snapshots to complete.
     """
     action = "Snapshotting EBS Volumes"
+    print_status(action, "pending") # Initial status
+
     if not volumes:
-        print_status(action, "skipped", "No EBS volumes provided to snapshot.")
+        print_status(action, "skipped", "No volumes provided to snapshot.")
         return
 
-    # Filter for volumes that actually have a VolumeId
-    valid_volumes = [v for v in volumes if v.get('VolumeId')]
-    if not valid_volumes:
-        print_status(action, "skipped", "No valid EBS volumes found to snapshot.")
+    print("\n" + Fore.YELLOW + Style.BRIGHT + "--- Action Confirmation Needed ---")
+    print(f"The following EBS volumes attached to instance {instance_id} were found:")
+    total_size_gb = 0
+    for vol in volumes:
+        size_str = f"{vol.get('SizeGiB', 'Unknown')} GiB"
+        print(f"  - Volume ID: {vol['VolumeId']}, Device: {vol['DeviceName']}, Size: {size_str}")
+        if isinstance(vol.get('SizeGiB'), (int, float)):
+            total_size_gb += vol['SizeGiB']
+    print(f"Total estimated size to snapshot: {total_size_gb} GiB")
+    print(Fore.YELLOW + "Creating snapshots preserves the state of these volumes for forensic analysis.")
+    print("-" * 40)
+    confirm = input(f"Do you want to proceed with creating snapshots for these {len(volumes)} volume(s)? ({Fore.YELLOW}yes/no{Style.RESET_ALL}): ").lower().strip()
+    print("-" * 40)
+
+    if confirm != 'yes':
+        skip_msg = "User chose NOT to create EBS snapshots."
+        print(Fore.YELLOW + f"  └── {skip_msg}")
+        print_status(action, "skipped", skip_msg)
+        logging.warning(skip_msg)
         return
 
-    print(f"\n{Fore.YELLOW}--- EBS Volume Snapshots ---")
-    print("Snapshots are crucial for forensic analysis. They capture the state of the disk at this point in time.")
-    print("The following volumes were found:")
-    for v in valid_volumes:
-        size_display = f"{v.get('SizeGB', 'Unknown')} GB" if v.get('SizeGB') is not None else "Unknown Size"
-        print(f"  - {v['VolumeId']} ({v.get('DeviceName', 'N/A')}) - {size_display}")
-    choice = input("Do you want to create snapshots of these volumes? (yes/no): ").lower().strip()
+    logging.info(f"User confirmed snapshotting for {len(volumes)} volumes.")
+    snapshot_ids = []
+    snapshot_status = {} # To track individual snapshot success/failure
 
-    if choice == 'yes':
-        print_status(action, "pending")
-        snapshot_ids = [] # List to store IDs of successfully initiated snapshots
-        snapshot_start_time = time.time()
-        today_date = datetime.utcnow().strftime('%Y%m%d') # For tagging
-        created_count = 0
-        error_count = 0
-
+    for vol in volumes:
+        vol_id = vol['VolumeId']
+        device_name = vol.get('DeviceName', 'UnknownDevice')
+        snapshot_description = f"Containment snapshot for {instance_id} - Volume {vol_id} ({device_name}) - {datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        print(f"  └── Creating snapshot for Volume: {vol_id}...")
         try:
-            for volume in valid_volumes:
-                vol_id = volume['VolumeId']
-                # Clean up device name for use in tags/description (replace non-alphanumeric)
-                device_name_raw = volume.get('DeviceName', 'unknown_device')
-                device_name_cleaned = ''.join(c if c.isalnum() or c in ['-', '_'] else '_' for c in device_name_raw)
+            snap_response = ec2_client.create_snapshot(
+                VolumeId=vol_id,
+                Description=snapshot_description,
+                TagSpecifications=[{
+                    'ResourceType': 'snapshot',
+                    'Tags': [
+                        {'Key': 'Name', 'Value': f"Containment-{instance_id}-{vol_id}"},
+                        {'Key': 'InstanceId', 'Value': instance_id},
+                        {'Key': 'VolumeId', 'Value': vol_id},
+                        {'Key': 'DeviceName', 'Value': device_name},
+                        {'Key': 'ContainmentScript', 'Value': 'True'}
+                    ]
+                }]
+            )
+            snapshot_id = snap_response['SnapshotId']
+            print(f"    └── Snapshot initiated: {snapshot_id}")
+            snapshot_ids.append(snapshot_id)
+            snapshot_status[snapshot_id] = 'pending'
+        except ClientError as e:
+            error_msg = f"Failed to initiate snapshot for {vol_id}: {e}"
+            print(Fore.RED + f"    └── Error: {error_msg}")
+            snapshot_status[vol_id] = f'Error: {e}' # Use vol_id as key if snapshot_id fails
+            logging.error(f"Snapshot Error for {vol_id}: {error_msg}", exc_info=True)
+        except Exception as e:
+            error_msg = f"An unexpected error occurred initiating snapshot for {vol_id}: {e}"
+            print(Fore.RED + f"    └── Error: {error_msg}")
+            snapshot_status[vol_id] = f'Unexpected Error: {e}'
+            logging.error(f"Snapshot Error for {vol_id}: {error_msg}", exc_info=True)
 
-                # Create descriptive elements for the snapshot
-                description = f"Incident Response snapshot for instance {instance_id}, volume {vol_id}, device {device_name_raw}"
-                # Construct a base tag name, ensuring it's within AWS length limits (255 chars)
-                snapshot_tag_name_base = f"IR-{instance_id}-{device_name_cleaned}-snapshot-{today_date}"
-                snapshot_tag_name = snapshot_tag_name_base[:255]
 
-                print(f"  └── Initiating snapshot for {vol_id} (Device: {device_name_raw})...")
-                try:
-                    snap_response = ec2_client.create_snapshot(
-                        VolumeId=vol_id,
-                        Description=description,
-                        TagSpecifications=[{
-                            'ResourceType': 'snapshot',
-                            'Tags': [
-                                {'Key': 'Name', 'Value': snapshot_tag_name},
-                                {'Key': 'IncidentResponseSourceInstance', 'Value': instance_id},
-                                {'Key': 'SourceVolumeId', 'Value': vol_id},
-                                {'Key': 'CreationTool', 'Value': 'AWS_IR_Containment_Script'} # Add tool tag
-                            ]
-                        }]
-                    )
-                    snapshot_id = snap_response['SnapshotId']
-                    snapshot_ids.append(snapshot_id)
-                    print(f"      └── Snapshot initiated: {snapshot_id}")
-                    created_count += 1
-                except ClientError as snap_err:
-                    print(Fore.RED + f"      └── ERROR creating snapshot for {vol_id}: {snap_err}")
-                    error_count += 1
-                    # Continue to the next volume even if one fails
+    if not snapshot_ids:
+        error_msg = "No snapshots were successfully initiated."
+        print_status(action, "error", error_msg)
+        logging.error(error_msg)
+        return # Exit if no snapshots started
 
-            # --- Wait for snapshots to complete (only if some were initiated) ---
-            if snapshot_ids:
-                print(f"\n  └── Waiting for {len(snapshot_ids)} snapshot(s) to complete...")
-                print(Fore.YELLOW + "      This can take a significant amount of time depending on volume size and AWS activity.")
-                waiter = ec2_client.get_waiter('snapshot_completed')
-                all_completed_successfully = True # Track overall success of the waiting phase
+    # Wait for snapshots to complete
+    print(f"  └── Waiting for {len(snapshot_ids)} snapshot(s) to complete...")
+    waiter = ec2_client.get_waiter('snapshot_completed')
+    try:
+        waiter.wait(
+            SnapshotIds=snapshot_ids,
+            WaiterConfig={'Delay': 15, 'MaxAttempts': 60} # Wait up to 15 mins (15*60s)
+        )
+        # Double check status after waiter returns, as it waits for ALL, some might fail individually before timeout
+        final_check = ec2_client.describe_snapshots(SnapshotIds=snapshot_ids)
+        all_successful = True
+        for snap in final_check.get('Snapshots', []):
+            snap_id = snap['SnapshotId']
+            state = snap['State']
+            if state == 'completed':
+                snapshot_status[snap_id] = 'completed'
+                print(Fore.GREEN + f"    └── Snapshot {snap_id} completed successfully.")
+            else:
+                snapshot_status[snap_id] = f'Failed ({state})'
+                print(Fore.RED + f"    └── Snapshot {snap_id} failed or ended in state: {state}")
+                all_successful = False
 
-                try:
-                    waiter.wait(
-                        SnapshotIds=snapshot_ids,
-                        WaiterConfig={
-                            'Delay': 30,  # Check status every 30 seconds
-                            'MaxAttempts': 120 # Wait up to 60 minutes (30s * 120 attempts)
-                        }
-                    )
-                    # After the waiter finishes, double-check the final state of each snapshot
-                    # as the waiter only confirms a terminal state (completed or error)
-                    print("  └── Checking final snapshot statuses...")
-                    final_statuses = ec2_client.describe_snapshots(SnapshotIds=snapshot_ids)
-                    for snap in final_statuses.get('Snapshots', []):
-                        snap_id = snap['SnapshotId']
-                        state = snap['State']
-                        if state == 'error':
-                             print(Fore.RED + f"      └── Snapshot {snap_id} FAILED: {snap.get('StateMessage', 'Unknown error')}")
-                             all_completed_successfully = False
-                        elif state == 'completed':
-                              print(Fore.GREEN + f"      └── Snapshot {snap_id} COMPLETED.")
-                        else: # Should not happen if waiter exited cleanly, but log if it does
-                             print(Fore.YELLOW + f"      └── Snapshot {snap_id} in unexpected final state: {state}")
-                             all_completed_successfully = False # Treat unexpected as not fully successful
+        if all_successful:
+            success_msg = f"All {len(snapshot_ids)} snapshots completed successfully."
+            print_status(action, "complete", success_msg)
+            logging.info(success_msg)
+        else:
+             warning_msg = "Some snapshots failed or did not complete successfully. Check details above."
+             print_status(action, "warning", warning_msg)
+             logging.warning(warning_msg + f" Status: {snapshot_status}")
 
-                    snapshot_duration = time.time() - snapshot_start_time
-                    if all_completed_successfully:
-                        print(f"  └── All {len(snapshot_ids)} initiated snapshots completed successfully in ~{snapshot_duration:.0f} seconds.")
-                        print_status(action, "complete")
-                    else:
-                         print_status(action, "error", f"One or more initiated snapshots did not complete successfully after ~{snapshot_duration:.0f} seconds.")
+    except WaiterError as e:
+        error_msg = f"Error or timeout waiting for snapshots: {e}. Some snapshots might still be pending or failed. Please check manually."
+        print_status(action, "error", error_msg)
+        logging.error(error_msg + f" Current Status: {snapshot_status}", exc_info=True)
+        # Log the final known status even on waiter error
+        try:
+            final_check = ec2_client.describe_snapshots(SnapshotIds=snapshot_ids)
+            for snap in final_check.get('Snapshots', []):
+                 snapshot_status[snap['SnapshotId']] = snap['State']
+            logging.error(f"Snapshot status at timeout: {snapshot_status}")
+        except Exception as desc_err:
+             logging.error(f"Could not describe snapshots after waiter error: {desc_err}")
 
-                except WaiterError as wait_error:
-                     # This catches timeouts or API errors during the wait
-                     print_status(action, "error", f"Error or timeout waiting for snapshots (they might still be running or have failed): {wait_error}")
-                     print(Fore.YELLOW + "      └── Please check the AWS console for the final status of snapshots: " + ", ".join(snapshot_ids))
-                except ClientError as desc_err:
-                     # This catches errors trying to describe the final statuses
-                     print_status(action, "error", f"Could not describe final snapshot statuses after waiting: {desc_err}")
-                     print(Fore.YELLOW + "      └── Please check the AWS console for the final status of snapshots: " + ", ".join(snapshot_ids))
-
-            elif created_count == 0 and error_count > 0:
-                 # Case where all snapshot creations failed
-                 print_status(action, "error", "Failed to initiate snapshot creation for any volumes.")
-            elif created_count == 0 and error_count == 0:
-                 # Should not happen if valid_volumes was not empty, but handle defensively
-                 print_status(action, "skipped", "No snapshots were initiated (unexpected state).")
-            # If created_count > 0 and error_count > 0, the waiting block handles the initiated ones.
-
-        except Exception as e: # Catch unexpected errors in the main snapshot loop
-            print_status(action, "error", f"An unexpected error occurred during the snapshotting process: {e}")
-
-    else:
-        print_status(action, "skipped", "Snapshot creation declined by user.")
+    except Exception as e:
+         error_msg = f"An unexpected error occurred waiting for snapshots: {e}"
+         print_status(action, "error", error_msg)
+         logging.error(error_msg + f" Current Status: {snapshot_status}", exc_info=True)
 
 
 def stop_instance(ec2_client, instance_id):
-    """Offers to stop the EC2 instance and waits for it to reach the stopped state."""
-    action = f"Stopping EC2 Instance {instance_id}"
+    """
+    Stops the specified EC2 instance if it is running.
+    Prompts the user for confirmation before stopping.
+    Waits for the instance to reach the 'stopped' state.
+    """
+    action = f"Stopping Instance: {instance_id}"
+    print_status(action, "pending") # Initial status
 
-    # --- Check current instance state before prompting ---
     try:
+        # Check current instance state first
         instance_status_response = ec2_client.describe_instance_status(
             InstanceIds=[instance_id],
             IncludeAllInstances=True # Important to get status even if not 'running'
         )
+
         current_state = None
         if instance_status_response.get('InstanceStatuses'):
+            # If status is available, use it
             current_state = instance_status_response['InstanceStatuses'][0]['InstanceState']['Name']
+        else:
+            # If no status (e.g., instance already stopped or terminated), describe instance for state
+            desc_response = ec2_client.describe_instances(InstanceIds=[instance_id])
+            if desc_response.get('Reservations') and desc_response['Reservations'][0].get('Instances'):
+                current_state = desc_response['Reservations'][0]['Instances'][0]['State']['Name']
 
-        # If already stopped or stopping, inform the user and skip the prompt
-        if current_state == 'stopped':
-            print(f"\n{Fore.BLUE}--- Stop EC2 Instance ---")
-            print_status(action, "info", f"Instance {instance_id} is already stopped.")
-            return # Exit the function, no action needed
-        elif current_state == 'stopping':
-            print(f"\n{Fore.BLUE}--- Stop EC2 Instance ---")
-            print_status(action, "info", f"Instance {instance_id} is already in the process of stopping.")
-            return # Exit the function, no action needed
-        elif current_state not in ['running', 'pending']:
-             # If it's in an unexpected state (e.g., terminated, shutting-down), skip stop
-             print(f"\n{Fore.BLUE}--- Stop EC2 Instance ---")
-             print_status(action, "warning", f"Instance {instance_id} is in state '{current_state}'. Skipping stop option.")
-             return
+        print(f"  └── Current instance state: {current_state}")
 
-    except ClientError as status_err:
-         # Log error getting status, but proceed to ask anyway. The stop call will fail if not stoppable.
-         print(Fore.YELLOW + f"Warning: Could not get current instance status before prompting stop: {status_err}")
+        if current_state in ['stopped', 'terminated', 'shutting-down']:
+            info_msg = f"Instance {instance_id} is already {current_state}. No action needed."
+            print(Fore.BLUE + f"  └── {info_msg}")
+            print_status(action, "skipped", info_msg)
+            logging.info(info_msg)
+            return # Nothing to do
 
-    # --- Prompt user to stop ---
-    print(f"\n{Fore.YELLOW}--- Stop EC2 Instance ---")
-    print("Stopping the instance prevents further malicious activity (like C2 communication or data exfiltration)")
-    print("and can also help reduce costs if the instance was compromised for resource abuse (e.g., crypto mining).")
-    print(f"Instance {instance_id} will be STOPPED, not TERMINATED. Data on EBS volumes persists.")
-    choice = input(f"Do you want to stop instance {instance_id} now? (yes/no): ").lower().strip()
+        if current_state not in ['running', 'pending']:
+            warn_msg = f"Instance {instance_id} is in an unexpected state: {current_state}. Attempting to stop might fail or be irrelevant."
+            print(Fore.YELLOW + f"  └── Warning: {warn_msg}")
+            logging.warning(warn_msg)
+            # Still proceed to prompt, as user might want to try anyway
 
-    if choice == 'yes':
-        print_status(action, "pending")
-        try:
-            # Initiate the stop operation
-            stop_response = ec2_client.stop_instances(InstanceIds=[instance_id])
+        # --- Confirmation Prompt ---
+        print("\n" + Fore.YELLOW + Style.BRIGHT + "--- Action Confirmation Needed ---")
+        print(f"You are about to STOP the EC2 instance: {Fore.CYAN}{instance_id}{Style.RESET_ALL}")
+        print(Fore.YELLOW + "Stopping the instance halts its execution and prevents further activity.")
+        print(Fore.RED + Style.BRIGHT + "WARNING: Ensure evidence (snapshots) has been collected if needed.")
+        print("-" * 40)
+        confirm = input(f"Do you want to proceed with stopping instance '{instance_id}'? ({Fore.YELLOW}yes/no{Style.RESET_ALL}): ").lower().strip()
+        print("-" * 40)
 
-            # Log the state change information from the response
-            if 'StoppingInstances' in stop_response and stop_response['StoppingInstances']:
-                state_change = stop_response['StoppingInstances'][0]
-                current_state_resp = state_change.get('CurrentState', {}).get('Name', 'Unknown')
-                previous_state_resp = state_change.get('PreviousState', {}).get('Name', 'Unknown')
-                print(f"  └── Stop request sent. Instance transitioning from {previous_state_resp} to {current_state_resp}.")
-            else:
-                 # Log if the response format is unexpected, though the call might have worked
-                 print(Fore.YELLOW + "  └── Stop request sent, but response format was unexpected.")
+        if confirm == 'yes':
+            print(f"  └── Initiating stop for instance {instance_id}...")
+            ec2_client.stop_instances(InstanceIds=[instance_id])
+            logging.info(f"User confirmed. Stop initiated for {instance_id}.")
 
-            # --- Wait for the instance to reach the 'stopped' state ---
-            print(f"  └── Waiting for instance {instance_id} to reach the 'stopped' state...")
+            # Wait for the instance to stop
+            print("  └── Waiting for instance to reach 'stopped' state...")
             waiter = ec2_client.get_waiter('instance_stopped')
-            waiter.wait(
-                InstanceIds=[instance_id],
-                WaiterConfig={'Delay': 15, 'MaxAttempts': 40} # Check every 15s for up to 10 mins
-            )
-            print(Fore.GREEN + f"  └── Instance {instance_id} confirmed stopped.")
-            print_status(action, "complete")
+            try:
+                waiter.wait(
+                    InstanceIds=[instance_id],
+                    WaiterConfig={'Delay': 15, 'MaxAttempts': 40} # Wait up to 10 mins
+                )
+                success_msg = f"Instance {instance_id} stopped successfully."
+                print(Fore.GREEN + f"  └── {success_msg}")
+                print_status(action, "complete", success_msg)
+                logging.info(success_msg)
+            except WaiterError as e:
+                error_msg = f"Error or timeout waiting for instance {instance_id} to stop: {e}. Please verify state manually."
+                print_status(action, "error", error_msg)
+                logging.error(error_msg, exc_info=True)
+            except Exception as e_wait:
+                 error_msg = f"An unexpected error occurred waiting for instance stop: {e_wait}"
+                 print_status(action, "error", error_msg)
+                 logging.error(error_msg, exc_info=True)
 
-        except ClientError as e:
-            err_code = e.response.get("Error", {}).get("Code")
-            # Handle specific errors related to stopping instances
-            if 'IncorrectInstanceState' in err_code or 'UnsupportedOperation' in err_code:
-                 msg = f"Instance {instance_id} is not in a stoppable state (e.g., already stopped, terminated, or stopping)."
-            elif 'AccessDenied' in err_code:
-                 msg = f"Permission denied for ec2:StopInstances on {instance_id}."
-            else:
-                msg = f"Failed to stop instance {instance_id}: {e}"
-            print_status(action, "error", msg)
-        except WaiterError as wait_err:
-             # Handle timeout or errors during the waiting period
-             print_status(action, "error", f"Instance stop initiated, but timed out or error occurred while waiting for confirmation: {wait_err}")
-             print(Fore.YELLOW + f"      └── Instance {instance_id} might still be stopping. Please verify its status in the AWS console.")
-        except Exception as e:
-            print_status(action, "error", f"An unexpected error occurred stopping instance: {e}")
-    else:
-        print_status(action,"warning", "Instance stop declined by user.")
-        print(Fore.RED + Style.BRIGHT + "  └── WARNING: Leaving a potentially compromised instance running poses security risks and may incur costs. It is strongly advised to stop the instance unless there's a specific reason not to.")
+        else:
+            skip_msg = f"User chose NOT to stop instance '{instance_id}'. Instance remains in state '{current_state}'."
+            print(Fore.YELLOW + f"  └── {skip_msg}")
+            print_status(action, "skipped", skip_msg)
+            logging.warning(skip_msg)
+
+    except ClientError as e:
+        error_msg = f"Failed to check status or stop instance {instance_id}: {e}"
+        print_status(action, "error", error_msg)
+        logging.error(f"{action} Error: {error_msg}", exc_info=True)
+    except Exception as e:
+         error_msg = f"An unexpected error occurred during instance stop process: {e}"
+         print_status(action, "error", error_msg)
+         logging.error(f"{action} Error: {error_msg}", exc_info=True)
 
 
-# --- Pre-flight Check Function ---
-
-def perform_preflight_checks(session, instance_id, instance_details, vpc_id, subnet_id, instance_role_name, attached_volumes):
+# --- UPDATED PREFLIGHT CHECKS ---
+def perform_preflight_checks(session, instance_id, instance_details, vpc_id, instance_role_name, attached_volumes):
     """
-    Performs non-mutating checks to verify permissions and resource states
-    before attempting containment actions.
-    Returns: tuple (bool: overall_success, list: issues_found)
+    Performs non-mutating checks before containment actions.
+    Checks permissions for SG changes, termination protection, role policy, snapshots, stop.
+    Returns: tuple (success_boolean, list_of_issues)
     """
     action = "Performing Pre-flight Checks"
     print_status(action, "pending")
-    issues_found = []
-    overall_success = True # Assume success initially
+    issues = []
+    success = True
+    ec2 = session.client('ec2')
+    iam = session.client('iam')
 
-    # Initialize clients needed for checks
-    try:
-        ec2 = session.client('ec2')
-        iam = session.client('iam')
-        # Add other clients if needed for specific checks (e.g., autoscaling, elb)
-    except Exception as e:
-        msg = f"Failed to create Boto3 clients for pre-flight checks: {e}"
-        print_status(action, "error", msg)
-        issues_found.append(msg)
-        return False, issues_found
+    # Permissions needed for SG containment
+    sg_perms_needed = [
+        "ec2:DescribeSecurityGroups",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateTags", # For tagging the SG
+        "ec2:RevokeSecurityGroupEgress", # To remove default rule
+        "ec2:ModifyInstanceAttribute" # To apply the SG
+    ]
+    # Permissions needed for Termination Protection
+    term_prot_perms_needed = ["ec2:ModifyInstanceAttribute"] # Already covered by SG check
+    # Permissions needed for Role Session Revocation (if role exists)
+    role_perms_needed = ["iam:PutRolePolicy"]
+    # Permissions needed for Snapshots
+    snapshot_perms_needed = [
+        "ec2:DescribeVolumes", # Already checked implicitly by getting volumes earlier? No, need explicit check.
+        "ec2:CreateSnapshot",
+        "ec2:DescribeSnapshots",
+        "ec2:CreateTags" # For tagging snapshots
+    ]
+    # Permissions needed for Stop Instance
+    stop_perms_needed = [
+        "ec2:DescribeInstanceStatus",
+        "ec2:StopInstances"
+    ]
 
-    # --- Check EC2 Instance State ---
+    # Combine all required EC2 perms for a single check if possible
+    all_ec2_perms = list(set(
+        sg_perms_needed +
+        term_prot_perms_needed +
+        snapshot_perms_needed +
+        stop_perms_needed
+    ))
+    all_iam_perms = list(set(role_perms_needed)) # Only PutRolePolicy for now
+
+    # --- Check Instance State ---
+    instance_state = instance_details.get('State', {}).get('Name', 'unknown')
+    print(f"  └── Checking Instance State: {instance_state}")
+    if instance_state in ['terminated', 'shutting-down']:
+        issue = f"Instance {instance_id} is already {instance_state}. Cannot proceed with containment."
+        issues.append(issue)
+        success = False # Critical failure
+        print(Fore.RED + f"    └── CRITICAL: {issue}")
+    elif instance_state == 'stopped':
+         issue = f"Instance {instance_id} is already stopped. Some actions (like Stop Instance) will be skipped."
+         issues.append(issue)
+         print(Fore.YELLOW + f"    └── WARNING: {issue}")
+         # Not critical, can still snapshot, apply SG etc.
+
+    # --- Check Required Permissions using DryRun ---
+    # Note: DryRun doesn't work for all actions (like CreateTags sometimes),
+    # and doesn't perfectly simulate all conditions, but it's a good first pass.
+
+    # Check EC2 Permissions
+    print(f"  └── Checking EC2 permissions via DryRun...")
     try:
-        status_response = ec2.describe_instance_status(InstanceIds=[instance_id], IncludeAllInstances=True)
-        if status_response.get('InstanceStatuses'):
-            state = status_response['InstanceStatuses'][0]['InstanceState']['Name']
-            if state not in ['running', 'stopped', 'pending']: # Stoppable states
-                 warning_msg = f"Instance {instance_id} is in state '{state}', which might interfere with some actions (like stop)."
-                 print(Fore.YELLOW + f"  └── Pre-flight Warning: {warning_msg}")
-                 issues_found.append(warning_msg)
-                 # Not necessarily a failure, but a warning
+        # Try a common action that requires multiple permissions if possible
+        # DryRun ModifyInstanceAttribute for SG change and Term Protection
+        ec2.modify_instance_attribute(InstanceId=instance_id, Groups=['sg-dryrunplaceholder'], DryRun=True)
+        ec2.modify_instance_attribute(InstanceId=instance_id, DisableApiTermination={'Value': True}, DryRun=True)
+        # DryRun StopInstances
+        ec2.stop_instances(InstanceIds=[instance_id], DryRun=True)
+        # DryRun CreateSnapshot (needs a volume ID)
+        if attached_volumes:
+            ec2.create_snapshot(VolumeId=attached_volumes[0]['VolumeId'], DryRun=True)
+        # DryRun CreateSecurityGroup
+        ec2.create_security_group(GroupName="dryrun-sg-test", Description="dryrun", VpcId=vpc_id, DryRun=True)
+        # Note: RevokeSecurityGroupEgress DryRun might be tricky without a real SG ID.
+        # Note: CreateTags DryRun might fail even with permissions.
+        print(Fore.GREEN + "    └── Basic EC2 DryRun checks passed (ModifyInstanceAttribute, StopInstances, CreateSnapshot, CreateSecurityGroup).")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            # This means the user *likely* has permission, DryRun itself is the "error"
+             print(Fore.GREEN + f"    └── Basic EC2 DryRun checks indicate permissions likely present for key actions.")
+        elif e.response['Error']['Code'] == 'UnauthorizedOperation':
+            issue = f"Missing critical EC2 permissions. DryRun failed for one or more actions (ModifyInstanceAttribute, StopInstances, CreateSnapshot, CreateSecurityGroup). Check specific error: {e}"
+            issues.append(issue)
+            success = False # Critical failure
+            print(Fore.RED + f"    └── CRITICAL: {issue}")
         else:
-             warning_msg = f"Could not retrieve current status for instance {instance_id}."
-             print(Fore.YELLOW + f"  └── Pre-flight Warning: {warning_msg}")
-             issues_found.append(warning_msg)
-    except ClientError as e:
-        error_msg = f"Permission denied or error checking instance status (ec2:DescribeInstanceStatus): {e}"
-        print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-        issues_found.append(error_msg)
-        overall_success = False
-    except Exception as e:
-        error_msg = f"Unexpected error checking instance status: {e}"
-        print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-        issues_found.append(error_msg)
-        overall_success = False
+            # Other errors during DryRun (e.g., invalid parameter)
+            issue = f"Potential issue during EC2 permission DryRun check: {e}. Proceed with caution."
+            issues.append(issue)
+            print(Fore.YELLOW + f"    └── WARNING: {issue}")
 
-
-    # --- Check NACL Permissions ---
-    try:
-        # Check describe permission needed before replace
-        ec2.describe_network_acls(Filters=[{'Name': 'association.subnet-id', 'Values': [subnet_id]}], MaxResults=5) # Corrected MaxResults
-        # Check create permission (best effort by trying describe on VPC)
-        ec2.describe_network_acls(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}], MaxResults=5) # Corrected MaxResults
-        # Note: Cannot directly check CreateNetworkAclEntry or ReplaceNetworkAclAssociation without trying them.
-        print(f"  └── Pre-flight: Basic NACL describe checks passed for subnet {subnet_id}.")
-    except ClientError as e:
-        error_msg = f"Permission denied or error describing NACLs (ec2:DescribeNetworkAcls): {e}. NACL containment might fail."
-        print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-        issues_found.append(error_msg)
-        overall_success = False
-    except Exception as e:
-        error_msg = f"Unexpected error during NACL pre-flight check: {e}"
-        print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-        issues_found.append(error_msg)
-        overall_success = False
-
-    # --- Check Termination Protection Modify Permission ---
-    try:
-        # Check describe permission as proxy for modify
-        ec2.describe_instance_attribute(InstanceId=instance_id, Attribute='disableApiTermination')
-        print(f"  └── Pre-flight: Basic check for termination protection attribute passed.")
-    except ClientError as e:
-        error_msg = f"Permission denied or error describing instance attributes (ec2:DescribeInstanceAttribute): {e}. Enabling termination protection might fail."
-        print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-        issues_found.append(error_msg)
-        overall_success = False # Consider this critical
-    except Exception as e:
-        error_msg = f"Unexpected error during termination protection pre-flight check: {e}"
-        print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-        issues_found.append(error_msg)
-        overall_success = False
-
-    # --- Check IAM Role Permissions (if role exists) ---
+    # Check IAM Permissions (only if role exists)
     if instance_role_name:
+        print(f"  └── Checking IAM permissions for role '{instance_role_name}' via DryRun...")
         try:
-            # Check permissions needed for get_role_permissions and revoke_role_sessions
-            iam.list_attached_role_policies(RoleName=instance_role_name, MaxItems=1)
-            iam.list_role_policies(RoleName=instance_role_name, MaxItems=1)
-            # Cannot easily check PutRolePolicy without trying it, but list checks are a good indicator.
-            print(f"  └── Pre-flight: Basic IAM policy listing checks passed for role {instance_role_name}.")
+            # DryRun PutRolePolicy
+            iam.put_role_policy(RoleName=instance_role_name, PolicyName="dryrun-policy", PolicyDocument='{"Version":"2012-10-17","Statement":[]}', DryRun=True)
+            print(Fore.GREEN + f"    └── Basic IAM DryRun check passed (PutRolePolicy).")
         except ClientError as e:
-            error_msg = f"Permission denied or error listing policies for role {instance_role_name} (iam:ListAttachedRolePolicies/iam:ListRolePolicies): {e}. Role analysis/revocation might fail."
-            print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-            issues_found.append(error_msg)
-            overall_success = False # Role actions are important
-        except Exception as e:
-            error_msg = f"Unexpected error during IAM role pre-flight check: {e}"
-            print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-            issues_found.append(error_msg)
-            overall_success = False
+            if e.response['Error']['Code'] == 'DryRunOperation':
+                 print(Fore.GREEN + f"    └── Basic IAM DryRun check indicates permissions likely present for PutRolePolicy.")
+            elif e.response['Error']['Code'] == 'UnauthorizedOperation':
+                issue = f"Missing critical IAM permission iam:PutRolePolicy for role '{instance_role_name}'. Cannot revoke sessions. DryRun failed: {e}"
+                issues.append(issue)
+                # This might be considered a warning or critical depending on policy
+                print(Fore.YELLOW + f"    └── WARNING: {issue}") # Treat as warning for now
+            else:
+                issue = f"Potential issue during IAM permission DryRun check for role '{instance_role_name}': {e}. Proceed with caution."
+                issues.append(issue)
+                print(Fore.YELLOW + f"    └── WARNING: {issue}")
 
-    # --- Check EBS Volume/Snapshot Permissions ---
-    volume_ids = [v['VolumeId'] for v in attached_volumes if v.get('VolumeId')]
-    if volume_ids:
-        try:
-            # Check describe volumes permission
-            ec2.describe_volumes(VolumeIds=volume_ids[:1]) # Check only first volume to limit API calls
-            # Check describe snapshots permission (needed for waiter)
-            # Attempting to describe a non-existent snapshot is one way, but might clutter logs.
-            # A simpler check is just to assume DescribeSnapshots is needed if CreateSnapshot is.
-            # Cannot check CreateSnapshot without trying it.
-            print(f"  └── Pre-flight: Basic EBS volume describe checks passed for volumes: {', '.join(volume_ids)}.")
-        except ClientError as e:
-            error_msg = f"Permission denied or error describing volumes (ec2:DescribeVolumes): {e}. Volume analysis/snapshotting might fail."
-            print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-            issues_found.append(error_msg)
-            overall_success = False # Snapshots are critical
-        except Exception as e:
-            error_msg = f"Unexpected error during EBS volume pre-flight check: {e}"
-            print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-            issues_found.append(error_msg)
-            overall_success = False
+    # --- Final Status ---
+    if not issues:
+        print_status(action, "complete", "All pre-flight checks passed.")
+    elif success: # Issues found, but none were critical failures
+        print_status(action, "warning", f"Pre-flight checks passed with warnings: {len(issues)} issue(s) found.")
+    else: # Critical failure encountered
+        print_status(action, "error", f"Pre-flight checks failed: {len(issues)} issue(s) found, including critical failures.")
 
-    # --- Check Stop Instance Permission ---
-    try:
-        # Describe status is already checked above, which is a good indicator for StopInstances permission.
-        # We could try a dry-run stop, but it might be overly complex here.
-        # Relying on the earlier DescribeInstanceStatus check.
-        pass # Assuming DescribeInstanceStatus check is sufficient proxy
-    except Exception as e:
-        # This block is unlikely to be hit unless DescribeInstanceStatus logic changes
-        error_msg = f"Unexpected error during stop instance pre-flight check: {e}"
-        print(Fore.RED + f"  └── Pre-flight ERROR: {error_msg}")
-        issues_found.append(error_msg)
-        overall_success = False
+    return success, issues
+# --- END UPDATED PREFLIGHT CHECKS ---
 
 
-    # --- Final Pre-flight Status ---
-    if overall_success and not issues_found:
-        print_status(action, "complete", "All critical pre-flight checks passed.")
-    elif overall_success and issues_found:
-         print_status(action, "warning", "Pre-flight checks passed, but warnings were noted (see above).")
-    else:
-         print_status(action, "error", "One or more critical pre-flight checks failed (see above).")
-
-    return overall_success, issues_found
-
-
-# --- Log Collection and Upload ---
-import logging # Ensure logging is imported if not already at top level
-import zipfile
-import os
-from datetime import timedelta
+# --- Log Collection Functions (Mostly Unchanged) ---
 
 def _create_s3_bucket(s3_client, bucket_name, region):
-    """Creates an S3 bucket if it doesn't exist."""
+    """Creates an S3 bucket if it doesn't exist. Handles potential naming conflicts."""
+    action = f"Ensuring S3 Bucket Exists: {bucket_name}"
+    print_status(action, "pending")
     try:
-        # Use head_bucket to check existence and permissions
-        s3_client.head_bucket(Bucket=bucket_name)
-        print(f"  └── S3 Bucket '{bucket_name}' already exists.")
-        logging.info(f"S3 Bucket '{bucket_name}' already exists.")
+        # Check if bucket exists first (HeadBucket is cheaper and faster)
+        try:
+            s3_client.head_bucket(Bucket=bucket_name)
+            print(f"  └── Bucket '{bucket_name}' already exists.")
+            print_status(action, "complete", "Bucket already exists.")
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404': # Not Found - Good, we can create it
+                print(f"  └── Bucket '{bucket_name}' does not exist. Creating...")
+            elif e.response['Error']['Code'] == '403': # Forbidden - Permission issue or bucket owned by another account
+                 print_status(action, "error", f"Permission denied or bucket '{bucket_name}' owned by another account.")
+                 return False
+            else: # Other errors checking head_bucket
+                raise e # Re-raise other ClientErrors
+
+        # Create the bucket
+        # Handle region constraints for bucket creation
+        if region == 'us-east-1':
+            s3_client.create_bucket(Bucket=bucket_name)
+        else:
+            s3_client.create_bucket(
+                Bucket=bucket_name,
+                CreateBucketConfiguration={'LocationConstraint': region}
+            )
+        print(f"  └── Successfully created bucket '{bucket_name}' in region '{region}'.")
+        print_status(action, "complete", "Bucket created successfully.")
         return True
+
     except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code")
-        if error_code == '404' or error_code == 'NoSuchBucket': # Not found, try to create
-            print(f"  └── S3 Bucket '{bucket_name}' not found. Attempting to create...")
-            logging.info(f"S3 Bucket '{bucket_name}' not found. Attempting to create...")
-            try:
-                # Handle regions other than us-east-1 which require LocationConstraint
-                if region == 'us-east-1':
-                    s3_client.create_bucket(Bucket=bucket_name)
-                else:
-                    s3_client.create_bucket(
-                        Bucket=bucket_name,
-                        CreateBucketConfiguration={'LocationConstraint': region}
-                    )
-                print(f"  └── Successfully created S3 bucket '{bucket_name}' in region {region}.")
-                logging.info(f"Successfully created S3 bucket '{bucket_name}' in region {region}.")
-                # Optional: Add bucket policy or block public access settings here if needed
-                return True
-            except ClientError as create_err:
-                msg = f"Failed to create S3 bucket '{bucket_name}': {create_err}"
-                print_status("Create S3 Bucket", "error", msg)
-                logging.error(msg, exc_info=True)
-                return False
-            except Exception as create_exc:
-                msg = f"Unexpected error creating S3 bucket '{bucket_name}': {create_exc}"
-                print_status("Create S3 Bucket", "error", msg)
-                logging.error(msg, exc_info=True)
-                return False
-        elif error_code == '403':
-            msg = f"Permission denied checking or creating S3 bucket '{bucket_name}' (s3:HeadBucket or s3:CreateBucket)."
-            print_status("Create S3 Bucket", "error", msg)
-            logging.error(msg)
+        error_code = e.response['Error']['Code']
+        if error_code == 'BucketAlreadyOwnedByYou':
+            print(f"  └── Bucket '{bucket_name}' already exists and is owned by you.")
+            print_status(action, "complete", "Bucket already exists.")
+            return True
+        elif error_code == 'BucketAlreadyExists':
+             error_msg = f"Bucket name '{bucket_name}' is already taken globally. Please choose a different name or strategy."
+             print_status(action, "error", error_msg)
+             return False
+        elif error_code == 'InvalidBucketName':
+             error_msg = f"Bucket name '{bucket_name}' is invalid. Check S3 naming rules."
+             print_status(action, "error", error_msg)
+             return False
+        else:
+            error_msg = f"Failed to create or check S3 bucket '{bucket_name}': {e}"
+            print_status(action, "error", error_msg)
             return False
-        else: # Other unexpected ClientError
-            msg = f"Error checking S3 bucket '{bucket_name}': {e}"
-            print_status("Create S3 Bucket", "error", msg)
-            logging.error(msg, exc_info=True)
-            return False
-    except Exception as e: # Catch other potential errors like invalid bucket name format
-         msg = f"Unexpected error during S3 bucket check/creation for '{bucket_name}': {e}"
-         print_status("Create S3 Bucket", "error", msg)
-         logging.error(msg, exc_info=True)
+    except Exception as e:
+         error_msg = f"An unexpected error occurred with S3 bucket '{bucket_name}': {e}"
+         print_status(action, "error", error_msg)
          return False
 
 
 def _get_cloudwatch_logs(logs_client, instance_id, start_time_ms, end_time_ms, local_log_dir):
-    """Attempts to find and download relevant CloudWatch logs."""
-    print_status("Fetching CloudWatch Logs", "pending")
-    log_groups_found = []
-    logs_downloaded = False
-    # Heuristics to find relevant log groups (adjust as needed)
-    log_group_prefixes = [f'/aws/ec2/{instance_id}', f'/aws/ssm/{instance_id}', '/var/log/', 'messages', 'syslog', instance_id]
+    """Attempts to find and download CloudWatch logs related to the instance."""
+    action = "Collecting CloudWatch Logs"
+    print_status(action, "pending")
+    found_logs = False
+    log_group_prefixes = [
+        f'/aws/ec2/instances/{instance_id}', # Common pattern
+        f'/var/log/messages', # System logs if configured
+        f'/var/log/syslog',
+        f'/var/log/cloud-init',
+        f'/var/log/amazon/ssm', # SSM Agent logs
+        # Add other potential common log group names/prefixes if known
+    ]
+    collected_files = []
 
     try:
-        paginator = logs_client.get_paginator('describe_log_groups')
+        # Find relevant log groups
         print("  └── Searching for relevant CloudWatch Log Groups...")
-        for page in paginator.paginate():
-            for group in page.get('logGroups', []):
-                group_name = group['logGroupName']
-                # Check if group name contains instance ID or common log paths
-                if any(prefix in group_name for prefix in log_group_prefixes):
-                    log_groups_found.append(group_name)
-                    print(f"      Found potentially relevant group: {group_name}")
+        paginator = logs_client.get_paginator('describe_log_groups')
+        relevant_groups = []
+        for prefix in log_group_prefixes:
+             try:
+                 # Use prefix filtering for efficiency
+                 pages = paginator.paginate(logGroupNamePrefix=prefix)
+                 for page in pages:
+                     for group in page.get('logGroups', []):
+                         group_name = group['logGroupName']
+                         if group_name not in relevant_groups: # Avoid duplicates
+                             print(f"    └── Found potential group: {group_name}")
+                             relevant_groups.append(group_name)
+             except ClientError as desc_err:
+                 if desc_err.response['Error']['Code'] in ['AccessDeniedException', 'AccessDenied']:
+                      print(Fore.YELLOW + f"    └── Permission denied searching for log groups with prefix '{prefix}'. Skipping.")
+                 else:
+                      print(Fore.YELLOW + f"    └── Error searching log groups with prefix '{prefix}': {desc_err}. Skipping.")
+             except Exception as desc_exc:
+                  print(Fore.YELLOW + f"    └── Unexpected error searching log groups with prefix '{prefix}': {desc_exc}. Skipping.")
 
-        if not log_groups_found:
-            print_status("Fetching CloudWatch Logs", "info", "No potentially relevant CloudWatch Log Groups found based on common patterns.")
-            logging.info("No potentially relevant CloudWatch Log Groups found.")
-            return False # Indicate no logs were downloaded
 
-        print(f"  └── Attempting to fetch logs from {len(log_groups_found)} group(s) for the last 30 days...")
-        for group_name in log_groups_found:
-            print(f"      Processing group: {group_name}")
-            group_file_path = os.path.join(local_log_dir, f"cloudwatch_{group_name.replace('/', '_')}.log")
+        if not relevant_groups:
+            print("  └── No potentially relevant CloudWatch Log Groups found based on common prefixes.")
+            print_status(action, "info", "No relevant log groups found.")
+            return [] # Return empty list
+
+        # Download logs from found groups
+        print(f"  └── Attempting to download logs from {len(relevant_groups)} group(s)...")
+        log_event_paginator = logs_client.get_paginator('filter_log_events')
+
+        for group_name in relevant_groups:
+            sanitized_group_name = group_name.replace('/', '_').strip('_') # Sanitize for filename
+            output_filename = os.path.join(local_log_dir, f"cloudwatch_{sanitized_group_name}.log")
+            print(f"    └── Downloading from '{group_name}' to '{output_filename}'...")
             try:
-                # Use filter_log_events for simplicity, might miss streams without events in range
-                log_event_paginator = logs_client.get_paginator('filter_log_events')
-                event_pages = log_event_paginator.paginate(
-                    logGroupName=group_name,
-                    startTime=start_time_ms,
-                    endTime=end_time_ms
-                )
-                with open(group_file_path, 'w', encoding='utf-8') as f:
+                with open(output_filename, 'w', encoding='utf-8') as f:
+                    event_pages = log_event_paginator.paginate(
+                        logGroupName=group_name,
+                        startTime=start_time_ms,
+                        endTime=end_time_ms
+                        # Can add filterPattern here if needed, e.g., 'ERROR'
+                    )
                     event_count = 0
                     for page in event_pages:
                         for event in page.get('events', []):
                             f.write(f"{datetime.fromtimestamp(event['timestamp']/1000).isoformat()} - {event['message']}\n")
                             event_count += 1
-                    if event_count > 0:
-                        print(f"      └── Downloaded {event_count} events to {os.path.basename(group_file_path)}")
-                        logs_downloaded = True
-                    else:
-                        print(f"      └── No events found in the specified time range for {group_name}.")
-                        # Clean up empty file
-                        try:
-                            os.remove(group_file_path)
-                        except OSError:
-                            pass # Ignore if file couldn't be removed
-            except ClientError as e:
-                 print(Fore.YELLOW + f"      └── Warning: Could not fetch logs from {group_name}: {e}")
-                 logging.warning(f"Could not fetch logs from {group_name}: {e}", exc_info=True)
-            except Exception as e:
-                 print(Fore.YELLOW + f"      └── Warning: Unexpected error fetching logs from {group_name}: {e}")
-                 logging.warning(f"Unexpected error fetching logs from {group_name}: {e}", exc_info=True)
+                        # Add a small delay to avoid throttling on very active groups
+                        time.sleep(0.2)
 
-        if logs_downloaded:
-            print_status("Fetching CloudWatch Logs", "complete", f"Downloaded logs saved in {local_log_dir}")
+                if event_count > 0:
+                    print(f"      └── Downloaded {event_count} events.")
+                    collected_files.append(output_filename)
+                    found_logs = True
+                else:
+                    print(f"      └── No events found in the specified time range for this group.")
+                    # Optionally remove the empty file
+                    try: os.remove(output_filename)
+                    except OSError: pass
+
+            except ClientError as filter_err:
+                 print(Fore.YELLOW + f"      └── Error downloading logs from '{group_name}': {filter_err}. Skipping group.")
+                 logging.warning(f"Error downloading logs from {group_name}: {filter_err}")
+            except Exception as file_err:
+                 print(Fore.YELLOW + f"      └── Error writing log file for '{group_name}': {file_err}. Skipping group.")
+                 logging.warning(f"Error writing log file for {group_name}: {file_err}")
+
+
+        if found_logs:
+            print_status(action, "complete", f"Downloaded logs to {len(collected_files)} file(s).")
         else:
-             print_status("Fetching CloudWatch Logs", "info", "Completed search, but no relevant log events found/downloaded.")
+            print_status(action, "info", "No log events found in the specified time range for any relevant groups.")
 
-        return logs_downloaded
+        return collected_files
 
     except ClientError as e:
-        msg = f"Permission denied or error describing log groups (logs:DescribeLogGroups or logs:FilterLogEvents): {e}"
-        print_status("Fetching CloudWatch Logs", "error", msg)
-        logging.error(msg, exc_info=True)
-        return False
+        print_status(action, "error", f"Failed during CloudWatch log collection: {e}")
+        return [] # Return empty list on error
     except Exception as e:
-        msg = f"Unexpected error fetching CloudWatch logs: {e}"
-        print_status("Fetching CloudWatch Logs", "error", msg)
-        logging.error(msg, exc_info=True)
-        return False
+        print_status(action, "error", f"An unexpected error occurred during log collection: {e}")
+        return []
+
 
 def _check_ssm_agent(ssm_client, instance_id):
-    """Checks if SSM Agent is potentially running on the instance."""
-    print_status("Checking SSM Agent Status", "pending")
+    """Checks if the SSM agent on the instance is online."""
+    action = f"Checking SSM Agent Status for {instance_id}"
+    print_status(action, "pending")
     try:
         response = ssm_client.describe_instance_information(
             Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
         )
-        instance_info = response.get('InstanceInformationList', [])
-        if instance_info:
-            ping_status = instance_info[0].get('PingStatus')
-            agent_version = instance_info[0].get('AgentVersion', 'Unknown')
-            if ping_status == 'Online':
-                msg = f"SSM Agent is Online (Version: {agent_version}). Manual system log retrieval via SSM might be possible."
-                print_status("Checking SSM Agent Status", "info", msg)
-                logging.info(msg)
-                return True
-            else:
-                msg = f"SSM Agent status is {ping_status} (Version: {agent_version}). System log retrieval via SSM likely not possible."
-                print_status("Checking SSM Agent Status", "warning", msg)
-                logging.warning(msg)
-                return False
-        else:
-            msg = f"Instance {instance_id} not found in SSM or not managed by SSM."
-            print_status("Checking SSM Agent Status", "info", msg)
-            logging.info(msg)
+        instance_info_list = response.get('InstanceInformationList', [])
+
+        if not instance_info_list:
+            print_status(action, "info", "Instance not managed by SSM or no information available.")
             return False
+
+        instance_info = instance_info_list[0]
+        ping_status = instance_info.get('PingStatus')
+
+        if ping_status == 'Online':
+            agent_version = instance_info.get('AgentVersion', 'Unknown')
+            print(Fore.GREEN + f"  └── SSM Agent is Online (Version: {agent_version}).")
+            print_status(action, "complete", "SSM Agent is Online.")
+            return True
+        else:
+            last_ping = instance_info.get('LastPingDateTime', 'N/A')
+            if isinstance(last_ping, datetime):
+                last_ping = last_ping.isoformat()
+            status_msg = f"SSM Agent is {ping_status}. Last ping: {last_ping}."
+            print(Fore.YELLOW + f"  └── {status_msg}")
+            print_status(action, "info", status_msg)
+            return False
+
     except ClientError as e:
-        msg = f"Permission denied or error checking SSM status (ssm:DescribeInstanceInformation): {e}"
-        print_status("Checking SSM Agent Status", "error", msg)
-        logging.error(msg, exc_info=True)
+        if e.response['Error']['Code'] in ['AccessDeniedException', 'AccessDenied']:
+             print_status(action, "error", "Permission denied checking SSM status (ssm:DescribeInstanceInformation).")
+        else:
+             print_status(action, "error", f"Could not check SSM Agent status: {e}")
         return False
     except Exception as e:
-        msg = f"Unexpected error checking SSM status: {e}"
-        print_status("Checking SSM Agent Status", "error", msg)
-        logging.error(msg, exc_info=True)
-        return False
+         print_status(action, "error", f"An unexpected error occurred checking SSM Agent: {e}")
+         return False
 
 
 def collect_and_upload_logs(session, instance_id, account_id, region, action_summary):
     """
-    Orchestrates log collection (CloudWatch, SSM check), action summary generation,
-    and upload to S3.
+    Orchestrates log collection: prompts user, creates bucket, gets logs,
+    creates summary, zips, uploads, and cleans up.
     """
-    action = f"Log Collection for {instance_id}"
-    print(f"\n{Fore.CYAN}--- Log Collection & Upload ---")
-    print("This step attempts to collect CloudWatch logs potentially related to the instance")
-    print("from the last 30 days and upload them to a dedicated S3 bucket.")
-    print(Fore.YELLOW + "Note: System-level logs (e.g., /var/log/messages) are NOT automatically collected via SSM due to complexity and reliability issues. Check SSM Agent status below.")
+    action = "Log Collection & Upload"
+    print_status(action, "pending") # Initial status
 
-    choice = input(f"Do you want to attempt log collection and upload? ({Fore.YELLOW}yes/no{Style.RESET_ALL}): ").lower().strip()
-    if choice != 'yes':
-        print_status(action, "skipped", "Log collection declined by user.")
-        logging.info("Log collection skipped by user.")
-        return
+    # --- Confirmation Prompt ---
+    print("\n" + Fore.YELLOW + Style.BRIGHT + "--- Optional: Log Collection ---")
+    print("This step attempts to:")
+    print("  1. Create a unique S3 bucket.")
+    print("  2. Download recent CloudWatch Logs potentially related to the instance.")
+    print("  3. Generate a summary file of actions taken by this script.")
+    print("  4. Zip the logs and summary.")
+    print("  5. Upload the zip file to the S3 bucket.")
+    print(Fore.YELLOW + "Note: Log collection requires additional permissions (S3, CloudWatch Logs).")
+    print("-" * 40)
+    confirm = input(f"Do you want to attempt log collection and upload for instance '{instance_id}'? ({Fore.YELLOW}yes/no{Style.RESET_ALL}): ").lower().strip()
+    print("-" * 40)
 
-    print_status(action, "pending")
-    logging.info(f"Starting log collection process for instance {instance_id}.")
+    if confirm != 'yes':
+        skip_msg = "User chose NOT to collect logs."
+        print(Fore.YELLOW + f"  └── {skip_msg}")
+        print_status(action, "skipped", skip_msg)
+        logging.warning(skip_msg)
+        return "Skipped by user"
 
-    # --- Setup ---
+    logging.info(f"User confirmed log collection for {instance_id}.")
     s3_client = session.client('s3')
     logs_client = session.client('logs')
-    ssm_client = session.client('ssm')
+
+    # Define names and paths
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    # Sanitize instance ID for use in names
-    safe_instance_id = instance_id.replace(':','-').replace('/','-')
-    # Ensure account_id is available, fallback if needed (though should be present after validation)
-    if not account_id:
-        # Attempt to get account ID if not provided (should be available from validate_credentials)
-        try:
-            account_id = session.client('sts').get_caller_identity().get('Account', 'unknown-account')
-            logging.warning(f"Account ID was not passed directly, retrieved as {account_id}")
-        except Exception as sts_err:
-             logging.error(f"Failed to retrieve account ID via STS for bucket naming: {sts_err}")
-             account_id = "unknown-account" # Fallback
-
-    # Use a shorter bucket name format: ir-logs-<account_id>-<timestamp>
-    bucket_name = f"ir-logs-{account_id}-{timestamp}"
-    # Ensure bucket name is compliant (lowercase, no underscores, 3-63 chars)
-    bucket_name = bucket_name.lower().replace('_','-')[:63] # Basic sanitization and length check
-    logging.info(f"Generated S3 bucket name: {bucket_name}")
-
-    local_log_dir = f"ir_logs_{safe_instance_id}_{timestamp}"
-    zip_filename = f"{local_log_dir}.zip"
-    s3_key = f"{safe_instance_id}/{zip_filename}" # Keep instance ID in the S3 key path
-    overall_success = True
-    logs_collected = False
+    # Ensure bucket name is globally unique and compliant
+    bucket_name = f"containment-logs-{account_id}-{instance_id}-{timestamp}".lower()
+    local_log_dir = f"temp_logs_{instance_id}_{timestamp}"
+    summary_filename = "action_summary.txt"
+    local_summary_path = os.path.join(local_log_dir, summary_filename)
+    zip_filename = f"containment_package_{instance_id}_{timestamp}.zip"
+    local_zip_path = os.path.join(local_log_dir, zip_filename) # Place zip inside temp dir initially
 
     try:
-        # Create local directory for logs
+        # 1. Create local temp directory
+        print(f"  └── Creating temporary directory: {local_log_dir}")
         os.makedirs(local_log_dir, exist_ok=True)
-        logging.info(f"Created local directory for logs: {local_log_dir}")
 
-        # --- Create S3 Bucket ---
-        # Note: SSM Agent check is now performed earlier in the main script
+        # 2. Create S3 Bucket
         if not _create_s3_bucket(s3_client, bucket_name, region):
-            overall_success = False # Bucket creation is critical
-            raise Exception("Failed to create or verify S3 bucket.") # Stop further processing
+            # Error handled and logged within _create_s3_bucket
+            raise Exception("Failed to create or verify S3 bucket.") # Raise to trigger cleanup
 
-        # --- Get CloudWatch Logs ---
+        # 3. Get CloudWatch Logs
+        # Get logs from the last 30 days
         end_time = datetime.now()
         start_time = end_time - timedelta(days=30)
         start_time_ms = int(start_time.timestamp() * 1000)
         end_time_ms = int(end_time.timestamp() * 1000)
 
-        logs_collected = _get_cloudwatch_logs(logs_client, instance_id, start_time_ms, end_time_ms, local_log_dir)
+        collected_log_files = _get_cloudwatch_logs(logs_client, instance_id, start_time_ms, end_time_ms, local_log_dir)
+        # Status printed within _get_cloudwatch_logs
 
-        # --- Package Logs ---
-        # --- Generate and Write Action Summary ---
-        summary_file_path = os.path.join(local_log_dir, "action_summary.txt")
-        summary_generated = False # Initialize flag
-        logging.info(f"Attempting to generate action summary report at {summary_file_path}")
+        # 4. Generate Action Summary File
+        print(f"  └── Generating action summary file: {local_summary_path}")
         try:
-            with open(summary_file_path, 'w', encoding='utf-8') as f:
+            with open(local_summary_path, 'w', encoding='utf-8') as f:
                 f.write(f"Containment Action Summary for Instance: {instance_id}\n")
                 f.write(f"Report Generated: {datetime.now().isoformat()}\n")
                 f.write("="*40 + "\n")
-                # Sort actions for consistent reporting (optional, requires action_summary to be passed)
-                if action_summary:
-                    for action_key in sorted(action_summary.keys()):
-                        summary_item = action_summary[action_key]
-                        f.write(f"Action: {action_key}\n")
-                        f.write(f"  Status: {summary_item.get('status', 'Unknown')}\n")
-                        details = summary_item.get('details')
-                        if details: # Only write details if they exist
-                             # Handle potential multi-line details nicely
-                             details_str = str(details).replace('\n', '\n    ')
-                             f.write(f"  Details: {details_str}\n")
-                        f.write("-" * 20 + "\n")
-                else:
-                    f.write("Action summary data was not provided to the log collection function.\n")
-            logging.info("Action summary report generated successfully.")
-            summary_generated = True # Set flag on success
+                # Sort actions by step number (key) for readability
+                for step, details in sorted(action_summary.items()):
+                    f.write(f"Step: {step}\n")
+                    f.write(f"  Status: {details.get('status', 'Unknown')}\n")
+                    f.write(f"  Details: {details.get('details', 'N/A')}\n")
+                    f.write("-" * 20 + "\n")
+            print("    └── Summary file generated.")
+            files_to_zip = collected_log_files + [local_summary_path]
+        except IOError as io_err:
+             print(Fore.RED + f"    └── Error writing summary file: {io_err}")
+             logging.error(f"Error writing summary file {local_summary_path}: {io_err}")
+             files_to_zip = collected_log_files # Zip only logs if summary fails
         except Exception as summary_err:
-            logging.error(f"Failed to generate action summary report: {summary_err}", exc_info=True)
-            print(Fore.YELLOW + f"Warning: Failed to generate action summary report: {summary_err}")
-            # summary_generated remains False
+             print(Fore.RED + f"    └── Unexpected error generating summary: {summary_err}")
+             logging.error(f"Unexpected error generating summary: {summary_err}")
+             files_to_zip = collected_log_files
 
+        # 5. Zip collected files
+        if not files_to_zip:
+            print("  └── No logs or summary file generated. Skipping zip and upload.")
+            print_status(action, "skipped", "No files to collect.")
+            # Cleanup handled in finally block
+            return "No files collected"
 
-        # --- Package Logs and Summary ---
-        # Package if logs were collected OR if the summary was generated
-        if logs_collected or summary_generated:
-            print_status("Packaging Logs & Summary", "pending")
-            logging.info(f"Packaging items from {local_log_dir} into {zip_filename}")
-            try:
-                with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    # Add action summary first if it exists
-                    if summary_generated and os.path.exists(summary_file_path):
-                         zipf.write(summary_file_path, arcname="action_summary.txt")
-                         logging.info("Added action_summary.txt to zip archive.")
-                    # Add collected logs
-                    if logs_collected:
-                        for root, _, files in os.walk(local_log_dir):
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                # Avoid adding the summary file again if it's iterated here
-                                if os.path.basename(file_path) != "action_summary.txt":
-                                    # Add file to zip, using arcname to avoid full path in zip
-                                    zipf.write(file_path, arcname=os.path.join(os.path.basename(root), file))
-                print_status("Packaging Logs & Summary", "complete", f"Created {zip_filename}")
-                logging.info(f"Successfully created log/summary archive {zip_filename}")
+        print(f"  └── Creating zip archive: {local_zip_path}")
+        try:
+            with zipfile.ZipFile(local_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file_path in files_to_zip:
+                    # Add file to zip using its basename to avoid deep paths in archive
+                    zipf.write(file_path, arcname=os.path.basename(file_path))
+            print(f"    └── Zip archive created with {len(files_to_zip)} file(s).")
+        except (zipfile.BadZipFile, OSError, FileNotFoundError) as zip_err:
+            error_msg = f"Failed to create zip archive: {zip_err}"
+            print_status(action, "error", error_msg)
+            logging.error(error_msg, exc_info=True)
+            raise Exception("Failed to create zip file.") # Trigger cleanup
 
-                # --- Upload to S3 ---
-                print_status("Uploading Logs to S3", "pending")
-                logging.info(f"Uploading {zip_filename} to s3://{bucket_name}/{s3_key}")
-                try:
-                    s3_client.upload_file(zip_filename, bucket_name, s3_key)
-                    print_status("Uploading Logs to S3", "complete", f"Successfully uploaded to s3://{bucket_name}/{s3_key}")
-                    logging.info(f"Successfully uploaded logs to s3://{bucket_name}/{s3_key}")
-                except ClientError as e:
-                    msg = f"Failed to upload logs to S3 (s3:PutObject permission?): {e}"
-                    print_status("Uploading Logs to S3", "error", msg)
-                    logging.error(msg, exc_info=True)
-                    overall_success = False
-                except Exception as e:
-                    msg = f"Unexpected error uploading logs to S3: {e}"
-                    print_status("Uploading Logs to S3", "error", msg)
-                    logging.error(msg, exc_info=True)
-                    overall_success = False
-
-            except Exception as e:
-                msg = f"Failed to package logs: {e}"
-                print_status("Packaging Logs", "error", msg)
-                logging.error(msg, exc_info=True)
-                overall_success = False
-        else:
-            logging.info("Skipping packaging and upload as no CloudWatch logs were downloaded and action summary failed to generate.")
-            print("  └── Skipping packaging and upload as no CloudWatch logs were downloaded and action summary failed.")
-
+        # 6. Upload Zip to S3
+        print(f"  └── Uploading {zip_filename} to s3://{bucket_name}/")
+        try:
+            s3_client.upload_file(local_zip_path, bucket_name, zip_filename)
+            success_msg = f"Successfully uploaded logs and summary to s3://{bucket_name}/{zip_filename}"
+            print(Fore.GREEN + f"    └── {success_msg}")
+            print_status(action, "complete", success_msg)
+            logging.info(success_msg)
+            return f"Logs uploaded to s3://{bucket_name}/{zip_filename}" # Return S3 path on success
+        except ClientError as upload_err:
+            error_msg = f"Failed to upload logs to S3: {upload_err}"
+            print_status(action, "error", error_msg)
+            logging.error(error_msg, exc_info=True)
+            raise Exception("Failed to upload zip file.") # Trigger cleanup
+        except FileNotFoundError:
+             error_msg = f"Zip file {local_zip_path} not found for upload. This shouldn't happen."
+             print_status(action, "error", error_msg)
+             logging.error(error_msg)
+             raise Exception("Zip file missing for upload.") # Trigger cleanup
 
     except Exception as e:
-        # Catch errors like makedirs failure or the exception from bucket creation
-        logging.error(f"Error during log collection setup or main process: {e}", exc_info=True)
-        overall_success = False
+        # Catch exceptions raised from sub-functions or this function
+        logging.error(f"Log collection failed: {e}", exc_info=True)
+        # Status already set by sub-functions or preceding code
+        return f"Failed: {e}" # Return error message
 
     finally:
-        # --- Cleanup Local Files ---
-        try:
-            if os.path.exists(zip_filename):
-                logging.info(f"Cleaning up local zip file: {zip_filename}")
-                os.remove(zip_filename)
-            if os.path.exists(local_log_dir):
-                logging.info(f"Cleaning up local log directory: {local_log_dir}")
-                # Remove downloaded log files first
-                for item in os.listdir(local_log_dir):
-                    item_path = os.path.join(local_log_dir, item)
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                # Remove the directory itself
-                os.rmdir(local_log_dir)
-        except Exception as cleanup_err:
-            logging.warning(f"Could not fully clean up local log files/directory: {cleanup_err}")
-            print(Fore.YELLOW + f"Warning: Could not fully clean up local log files/directory: {cleanup_err}")
+        # 7. Cleanup local files
+        if os.path.exists(local_log_dir):
+            print(f"  └── Cleaning up temporary directory: {local_log_dir}")
+            try:
+                shutil.rmtree(local_log_dir)
+                print("    └── Local cleanup complete.")
+            except OSError as cleanup_err:
+                print(Fore.YELLOW + f"    └── Warning: Could not completely remove temp directory {local_log_dir}: {cleanup_err}")
+                logging.warning(f"Could not remove temp dir {local_log_dir}: {cleanup_err}")
 
-    # --- Final Status ---
-    if overall_success and logs_collected:
-        print_status(action, "complete", f"Log collection finished. Logs uploaded to s3://{bucket_name}/{s3_key}")
-    elif overall_success and not logs_collected:
-         print_status(action, "complete", "Log collection process finished, but no CloudWatch logs were found/downloaded to upload.")
-    else:
-        print_status(action, "error", f"Log collection process encountered errors. Check logs. Bucket '{bucket_name}' may contain partial/no data.")
-
-    print(Fore.YELLOW + f"Reminder: Remember to analyze the logs in s3://{bucket_name}/{s3_key} and delete the bucket '{bucket_name}' when no longer needed.")
-    logging.info(f"Log collection function finished. Bucket: {bucket_name}, Key: {s3_key}")
-    print(Fore.RED + Style.BRIGHT + "  └── WARNING: Leaving a potentially compromised instance running poses security risks and may incur costs. It is strongly advised to stop the instance unless there's a specific reason not to.")
+# Need to import os, shutil, zipfile, timedelta at the top
+import os
+import shutil
+import zipfile
+from datetime import timedelta

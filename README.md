@@ -6,42 +6,42 @@
 
 **Purpose:** To rapidly contain a potentially compromised EC2 instance within an AWS environment by isolating it, preserving evidence,and preventing further unauthorized actions.
 
-**CAUTION ADVISED** 
+**CAUTION ADVISED**
 
-**Disclaimer:** This script performs alterations to your AWS environment, including modifying Network ACLs, Instance Attributes, IAM Roles, and Instance State.
+**Disclaimer:** This script performs alterations to your AWS environment, including modifying Security Groups, Instance Attributes, IAM Roles, and Instance State.
 
 *   **DO NOT run this script unless you have tested this within a non-production enviroment and understand the changes that will be made.**
 *   **Incorrect use can lead to loss of connectivity, data inaccessibility (if cleanup is improper), or interference with legitimate operations.**
-*   **Always prioritize following your organization's established and tested Incident Response procedures.** This script is a very powerful tool, I would highly recommend testing this tool first before deploying and using. Please see the test plan where I have outlined all testing that has been done to check every flow works. If any flows do not work please reach out with the errors(s) and I will look at altering/improving. 
+*   **Always prioritize following your organization's established and tested Incident Response procedures.** This script is a very powerful tool, I would highly recommend testing this tool first before deploying and using. Please see the test plan where I have outlined all testing that has been done to check every flow works. If any flows do not work please reach out with the errors(s) and I will look at altering/improving.
 *   The author assumes **NO LIABILITY** for any damages or disruptions caused by the use or misuse of this script.
 
-I have put mutliple error checks, pre checks (of permissions) that occur prior to running any commands. I have additionally presented below every issue below that could affect this not running (that I could think of). Please always check and understand this prior to running this script for an incident. 
+I have put mutliple error checks, pre checks (of permissions) that occur prior to running any commands. I have additionally presented below every issue below that could affect this not running (that I could think of). Please always check and understand this prior to running this script for an incident.
 
 If you do find any issues with the logic or flow of this script, please let me know and happy to discuss or change.
 
 ## Containment Strategy & Steps
 
-The script employs a multi-faceted strategy to contain a potentially compromised EC2 instance. It guides the user through the following automated steps:
+The script employs a multi-optioned strategy to contain a potentially compromised EC2 instance. It guides the user through the following automated steps:
 
 1.  **Credential Input, Validation & Account Confirmation:**
-    *   **Action:** Prompts for temporary AWS credentials. Uses `getpass` to hide sensitive input. Authenticates using `sts:GetCallerIdentity`, displays the AWS Account ID and attempts to display the Account Alias (`iam:ListAccountAliases`). **Crucially, it then prompts the user to confirm (`yes/no`) if the identified account is the correct target before proceeding.** Performs basic checks for essential EC2 and IAM read permissions.
-    *   **Rationale:** Ensures the script authenticates correctly and targets the intended AWS account, preventing accidental actions in the wrong environment. Displaying the alias adds user-friendliness. Basic permission checks provide early feedback. Temporary credentials limit exposure.
+    *   **Action:** Prompts for temporary AWS credentials. Uses `getpass` to hide sensitive input. Authenticates using `sts:GetCallerIdentity`, displays the AWS Account ID and attempts to display the Account Alias (`iam:ListAccountAliases`). **Crucially, it then prompts the user to confirm (`yes/no`) if the identified account is the correct target before proceeding.** Performs basic checks for essential EC2 and IAM read permissions that will be used as part of the script.
+    *   **Rationale:** Ensures the script authenticates correctly and targets the intended AWS account, preventing accidental actions in the wrong environment. Displaying the alias adds mental confirmation to the Incident Responder they are working in the correct AWS Account. Basic permission checks provide early feedback. Temporary credentials limit exposure.
 
 2.  **Instance Identification:**
-    *   **Action:** Lists running or stopped EC2 instances in the specified region (`ec2:DescribeInstances`). Prompts the user to select the target instance ID. Gathers essential details like VPC ID and Subnet ID from the selected instance's metadata.
-    *   **Rationale:** Accurately identifies the instance to be contained based on user input. VPC and Subnet IDs are crucial for network isolation.
+    *   **Action:** Lists running or stopped EC2 instances in the specified region (`ec2:DescribeInstances`). Prompts the user to select the target instance ID. Gathers essential details like VPC ID and the instance's current Security Groups from the selected instance's metadata.
+    *   **Rationale:** Accurately identifies the instance to be contained based on user input. VPC ID is crucial for creating the isolation Security Group. Knowing original SGs is needed for cleanup.
 
 3.  **Pre-flight Checks:**
-    *   **Action:** Before modifying resources, the script performs several non-mutating checks using `describe` or `list` API calls. It verifies the instance state, basic permissions for NACL changes, termination protection modification, IAM role policy listing, and EBS volume description.
+    *   **Action:** Before modifying resources, the script performs several non-mutating checks (doesn't change the environment) using `describe` or `list` API calls, including DryRun attempts where possible. It verifies the instance state, basic permissions for Security Group changes (`ec2:CreateSecurityGroup`, `ec2:ModifyInstanceAttribute`, `ec2:RevokeSecurityGroupEgress`), termination protection modification, IAM role policy listing/application, EBS volume description/snapshotting, and instance stopping.
     *   **Rationale:** This step aims to identify potential permission issues or problematic resource states *before* attempting irreversible actions, reducing the chance of mid-script failures. If critical checks fail, the script exits. If warnings are found, the user is prompted whether to continue.
 
-4.  **Network Isolation (NACL Containment):**
+4.  **Network Isolation (Security Group Containment):**
     *   **Action:**
-        *   Identifies the current Network ACL (NACL) associated with the instance's subnet (`ec2:DescribeNetworkAcls`).
-        *   Creates a new, dedicated "Containment NACL" (or reuses one if it exists) tagged with a specific name (`ec2:CreateNetworkAcl`, `ec2:CreateTags`).
-        *   Adds explicit DENY ALL rules for both Ingress (inbound) and Egress (outbound) traffic for **both IPv4 (`0.0.0.0/0`) and IPv6 (`::/0`)** to this Containment NACL (`ec2:CreateNetworkAclEntry`).
-        *   Replaces the subnet's original NACL association with this new, restrictive Containment NACL (`ec2:ReplaceNetworkAclAssociation`).
-    *   **Rationale:** This is the primary network containment step. By blocking all IPv4 and IPv6 traffic at the subnet level via the NACL, it prevents the instance from communicating with any other resource (internal or external), stopping potential command-and-control (C2) communication, data exfiltration, or lateral movement over the network.
+        *   Checks if a dedicated "Containment Security Group" already exists in the instance's VPC (`ec2:DescribeSecurityGroups`).
+        *   If not found, creates a new Security Group with a specific name and description, tagged appropriately (`ec2:CreateSecurityGroup`, `ec2:CreateTags`).
+        *   Removes the default outbound rule (Allow All Egress) from the newly created Containment SG to ensure complete isolation (`ec2:RevokeSecurityGroupEgress`).
+        *   Modifies the target instance's attributes to associate it *only* with this Containment Security Group, effectively detaching all its original Security Groups (`ec2:ModifyInstanceAttribute`).
+    *   **Rationale:** This is the primary network containment step. By applying a Security Group with no inbound and no outbound rules directly to the instance, it prevents the instance from communicating with any other resource (internal or external), stopping potential command-and-control (C2) communication, data exfiltration, or lateral movement over the network *without affecting other instances in the same subnet*.
 
 5.  **Prevent Accidental Deletion (Termination Protection):**
     *   **Action:** Enables the "Termination Protection" attribute on the instance (`ec2:ModifyInstanceAttribute`).
@@ -49,7 +49,7 @@ The script employs a multi-faceted strategy to contain a potentially compromised
 
 6.  **Situational Awareness (Information Gathering):**
     *   **Action:** Checks if the instance belongs to an Auto Scaling Group (`autoscaling:DescribeAutoScalingInstances`) or is registered with Load Balancers (Classic: `elasticloadbalancing:DescribeLoadBalancers`; ALB/NLB: `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth`).
-    *   **Rationale:** Provides context. If part of an ASG or behind an LB, containment actions (like stopping the instance or network isolation) might trigger health check failures, potentially leading the ASG/LB to replace the instance. This awareness helps anticipate such behavior.
+    *   **Rationale:** Provides context. If part of an ASG or behind an LB, containment actions (like stopping the instance or network isolation via SG) might trigger health check failures, potentially leading the ASG/LB to replace the instance. This awareness helps anticipate such behavior.
 
 7.  **IAM Role Assessment:**
     *   **Action:**
@@ -60,13 +60,15 @@ The script employs a multi-faceted strategy to contain a potentially compromised
         *   Lists the permissions (managed and inline policies) attached to the identified IAM Role (`iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`).
     *   **Rationale:** Understanding the instance's IAM role is critical.
         *   Knowing the role name allows for targeted actions like session revocation.
-        *   IMDSv1 check highlights the risk of credential theft if the instance was compromised.
+        *   IMDSv1 check highlights the risk of credential theft if the instance was compromised (if instance is compromised, IMDSv2 does not matter).
         *   Finding other instances with the same role identifies potential blast radius or lateral movement if the role credentials were compromised.
         *   Listing permissions reveals what actions an attacker *could* have performed with the stolen credentials.
 
 8.  **Revoke Active IAM Role Sessions:**
     *   **Action:** Prompts the user to attach (or overwrite) a DENY ALL inline policy to the identified IAM Role (`iam:PutRolePolicy`).
-    *   **Rationale:** If the instance's IAM credentials were compromised (e.g., via IMDSv1), this step invalidates those credentials *immediately*. The DENY ALL policy prevents the stolen credentials from being used to perform any further actions in the AWS account, effectively stopping ongoing misuse of that specific role. This is a crucial step to prevent further damage.
+    *   **Rationale:** If the instance's IAM credentials were compromised, this step invalidates those credentials *immediately*. The DENY ALL policy prevents the stolen credentials from being used to perform any further actions in the AWS account, effectively stopping ongoing misuse of that specific role. This is a crucial step to prevent further damage.
+
+    Do note, any other instances that are using this role will also not work until you remove the inline policy.
 
 9.  **Preserve Evidence (EBS Snapshots):**
     *   **Action:**
@@ -121,7 +123,7 @@ The project is organized into the following directories:
 
 The following constants can be adjusted in `config.py`:
 
-*   `CONTAINMENT_NACL_NAME`: The name assigned to the Network ACL created for containment. Default: `"Containment-NACL-IncidentResponse"`
+*   `CONTAINMENT_SG_NAME`: The name assigned to the Security Group created for containment. Default: `"Containment-SG-IncidentResponse"`
 *   `DENY_POLICY_NAME`: The name assigned to the inline IAM policy used to revoke role sessions. Default: `"DenyAllPolicyForIncidentResponse"`
 
 ## Required AWS Permissions & Rationale
@@ -131,18 +133,17 @@ The script requires credentials with sufficient permissions to perform its tasks
 *   **`sts:GetCallerIdentity`**:
     *   **Why:** To verify that the provided credentials are valid and to display the identity being used.
 *   **EC2 Permissions:**
-    *   `ec2:DescribeInstances`: **Why:** To list instances for selection, get instance details (VPC, subnet, IAM profile, metadata options), and find other instances with the same role.
+    *   `ec2:DescribeInstances`: **Why:** To list instances for selection, get instance details (VPC, IAM profile, metadata options, original SGs), and find other instances with the same role.
     *   `ec2:DescribeInstanceStatus`: **Why:** To check if the instance is already stopped before attempting to stop it again.
-    *   `ec2:DescribeNetworkAcls`: **Why:** To find the original NACL of the subnet and check if the containment NACL already exists.
-    *   `ec2:CreateNetworkAcl`: **Why:** To create the dedicated containment NACL if it doesn't exist.
-    *   `ec2:CreateNetworkAclEntry`: **Why:** To add the DENY ALL ingress and egress rules to the containment NACL.
-    *   `ec2:ReplaceNetworkAclAssociation`: **Why:** To associate the containment NACL with the instance's subnet, replacing the original one.
-    *   `ec2:ModifyInstanceAttribute`: **Why:** To enable termination protection on the instance.
+    *   `ec2:DescribeSecurityGroups`: **Why:** To check if the containment Security Group already exists.
+    *   `ec2:CreateSecurityGroup`: **Why:** To create the dedicated containment Security Group if it doesn't exist.
+    *   `ec2:RevokeSecurityGroupEgress`: **Why:** To remove the default allow-all egress rule from the containment SG.
+    *   `ec2:ModifyInstanceAttribute`: **Why:** To apply the containment Security Group exclusively to the instance and to enable termination protection.
     *   `ec2:DescribeVolumes`: **Why:** To get the size of attached EBS volumes before snapshotting.
     *   `ec2:CreateSnapshot`: **Why:** To create the EBS snapshots for forensic evidence.
     *   `ec2:DescribeSnapshots`: **Why:** To monitor the status of snapshot creation and wait for completion.
     *   `ec2:StopInstances`: **Why:** To stop the execution of the compromised instance.
-    *   `ec2:CreateTags`: **Why:** To tag the created containment NACL and EBS snapshots for easier identification and cleanup.
+    *   `ec2:CreateTags`: **Why:** To tag the created containment Security Group and EBS snapshots for easier identification and cleanup.
 *   **IAM Permissions:**
     *   `iam:ListAccountAliases`: **Why:** (Optional but Recommended) To retrieve and display the AWS Account Alias during the initial account confirmation step, making it easier for the user to verify the target account. The script can proceed without this permission but won't display the alias.
     *   `iam:ListRoles`: **Why:** Used in the initial credential validation check to verify basic IAM read access.
@@ -197,10 +198,9 @@ For enhanced security, instead of using IAM user credentials directly, it's reco
             "Action": [
                 "ec2:DescribeInstances",
                 "ec2:DescribeInstanceStatus",
-                "ec2:DescribeNetworkAcls",
-                "ec2:CreateNetworkAcl",
-                "ec2:CreateNetworkAclEntry",
-                "ec2:ReplaceNetworkAclAssociation",
+                "ec2:DescribeSecurityGroups",
+                "ec2:CreateSecurityGroup",
+                "ec2:RevokeSecurityGroupEgress",
                 "ec2:ModifyInstanceAttribute",
                 "ec2:DescribeVolumes",
                 "ec2:CreateSnapshot",
@@ -287,9 +287,9 @@ Follow these steps to run the containment script directly against an existing EC
     *   Applying the DENY ALL policy to revoke IAM Role sessions.
     *   Creating EBS snapshots.
     *   Stopping the EC2 instance.
-    Read the prompts carefully and type `yes` to confirm or `no` to skip a specific action.
+    Read the prompts carefully and type `yes` to confirm or `no` to skip a specific action. (Note: Applying the containment Security Group happens automatically after pre-flight checks pass).
 9.  **Confirm Log Collection (Optional):** The script will ask if you want to attempt to collect CloudWatch logs and upload them to a new S3 bucket.
-10. **Review Output & Log File:** Once the script finishes, review the entire console output log *and* the generated `.log` file to understand which actions were completed successfully, skipped, or encountered errors. If log collection was performed, note the S3 bucket name provided.
+10. **Review Output & Log File:** Once the script finishes, review the entire console output log *and* the generated `.log` file to understand which actions were completed successfully, skipped, or encountered errors. If log collection was performed, note the S3 bucket name provided. Note the original Security Group IDs logged for cleanup.
 
 ## Optional: Setting up a Test Environment with Terraform
 
@@ -334,18 +334,17 @@ If you want to test the script in a controlled environment without using existin
 
 ## Limitations & Known Issues
 
-*   **Multi-ENI Instances:** The script primarily focuses on the subnet associated with the instance's primary network interface (as reported by `DescribeInstances`). If the instance has multiple Elastic Network Interfaces (ENIs) in different subnets, network containment will only be applied to the identified subnet, leaving other interfaces potentially active. Manual NACL changes would be needed for other subnets.
-*   **Specialized Access Methods:** Applying the strict NACL might block legitimate forensic access methods like SSM Session Manager or EC2 Instance Connect if they rely on network paths now denied by the NACL. Consider your forensic access strategy beforehand.
-*   **Resource-Based Policies:** Revoking IAM role sessions (Step 7) only affects identity-based permissions. It does *not* prevent access granted to the role ARN via resource-based policies (e.g., S3 bucket policies).
+*   **Specialized Access Methods:** Applying the strict isolation Security Group will block legitimate forensic access methods like SSM Session Manager or EC2 Instance Connect if they rely on network paths now denied by the SG. Consider your forensic access strategy beforehand (e.g., using VPC Endpoints for SSM that might still be allowed depending on endpoint policy and SG rules, or relying on console access if available).
+*   **Resource-Based Policies:** Revoking IAM role sessions (Step 8) only affects identity-based permissions. It does *not* prevent access granted to the role ARN via resource-based policies (e.g., S3 bucket policies).
 *   **KMS Permissions:** If target EBS volumes are encrypted with customer-managed KMS keys, the credentials running the script might need additional `kms:CreateGrant`, `kms:DescribeKey`, etc., permissions to successfully create snapshots.
 *   **Spot Instances:** Attempting to stop a Spot instance may result in its termination, depending on its interruption behavior configuration. The script does not explicitly check for Spot instance types.
 *   **Error Handling & State:** While basic error handling exists, complex AWS state issues or API throttling might cause script failure. The script does not have built-in rollback capabilities; manual cleanup is required if it exits unexpectedly mid-process.
-*   **Resource Limits:** Actions might fail if AWS account limits are reached (e.g., max snapshots, max inline policies).
+*   **Resource Limits:** Actions might fail if AWS account limits are reached (e.g., max snapshots, max inline policies, max security groups).
 
 ## Troubleshooting
 
 *   **Permission Errors (`AccessDenied`, `UnauthorizedOperation`):** Ensure the temporary credentials used have *all* the permissions listed under "Required AWS Permissions". Check CloudTrail logs for the specific API call that failed.
-*   **Resource State Errors (`IncorrectInstanceState`, `InvalidVolume.NotFound`):** The target resource might not be in a state compatible with the action (e.g., trying to stop an already stopped instance, snapshotting a volume that was just deleted). Check the AWS console for the resource's current status.
+*   **Resource State Errors (`IncorrectInstanceState`, `InvalidVolume.NotFound`, `InvalidGroup.NotFound`):** The target resource might not be in a state compatible with the action (e.g., trying to stop an already stopped instance, snapshotting a volume that was just deleted, modifying a non-existent SG). Check the AWS console for the resource's current status.
 *   **Throttling Errors:** If you encounter throttling exceptions, you may need to wait and retry, or request service limit increases if performing actions at scale (though this script targets single instances).
 *   **Timeout Errors (Waiters):** Waiters for snapshot completion or instance stopping might time out if the operation takes longer than expected. The operation might still complete successfully in AWS. Verify the status in the AWS console. Check the generated `.log` file for detailed error messages.
 
@@ -353,10 +352,10 @@ If you want to test the script in a controlled environment without using existin
 
 After the incident is resolved and forensic analysis is complete, **manual cleanup is essential**:
 
-1.  **Restore Original NACL:**
-    *   Identify the original NACL ID and the *new* association ID created by the script (logged in the script output/log file).
-    *   Use the AWS Console or CLI (`aws ec2 replace-network-acl-association --association-id <new_association_id> --network-acl-id <original_nacl_id>`) to re-associate the original NACL with the subnet.
-    *   Optionally, delete the `Containment-NACL-IncidentResponse` NACL itself if no longer needed (`aws ec2 delete-network-acl --network-acl-id <containment_nacl_id>`).
+1.  **Restore Original Security Group(s):**
+    *   Identify the original Security Group IDs associated with the instance *before* containment (logged in the script output/log file).
+    *   Use the AWS Console or CLI (`aws ec2 modify-instance-attribute --instance-id <instance_id> --groups <sg-id-1> <sg-id-2> ...`) to re-attach the original Security Group(s) to the instance.
+    *   Optionally, delete the `Containment-SG-IncidentResponse` Security Group itself if no longer needed (`aws ec2 delete-security-group --group-id <containment_sg_id>`). **Ensure no other instances are accidentally using it first.**
 2.  **Remove Deny Policy from Role:**
     *   If role sessions were revoked, navigate to the affected IAM Role in the AWS Console.
     *   Find and delete the inline policy named `DenyAllPolicyForIncidentResponse` (or your custom name) to restore the role's original permissions.

@@ -10,7 +10,7 @@ This plan outlines testing for the AWS EC2 Instance Containment Script. It verif
 --- Test Objectives ---
 - Verify successful execution of all script stages.
 - Validate user prompts, confirmations, and optional step handling.
-- Confirm correct creation/modification of AWS resources (NACLs, IAM Policies, Snapshots, etc.).
+- Confirm correct creation/modification of AWS resources (Security Groups, IAM Policies, Snapshots, etc.).
 - Ensure accurate logging and error handling.
 - Validate cleanup instructions.
 
@@ -65,8 +65,8 @@ Objective: Verify correct AWS account confirmation and target instance selection
 *   **Step 2.6:** Select target instance ID when prompted.
     *   **Justification:** Confirms the user can select the specific instance to be contained. Test valid and invalid IDs. Test Ctrl+C.
     *   **Result:** [ ] Pass / [ ] Fail (Valid ID) | [ ] Pass / [ ] Fail (Invalid ID)
-*   **Step 2.7:** Verify extraction of VPC ID and Subnet ID.
-    *   **Justification:** Confirms the script correctly identifies network details required for NACL containment.
+*   **Step 2.7:** Verify extraction of VPC ID and original Security Group IDs.
+    *   **Justification:** Confirms the script correctly identifies details required for Security Group containment (VPC ID for SG creation, original SGs for cleanup).
     *   **Result:** [ ] Pass / [ ] Fail
 
 **Stage 3: Pre-flight Checks**
@@ -75,8 +75,8 @@ Objective: Verify preliminary checks for permissions and resource states before 
 *   **Step 3.1:** Verify execution of `perform_preflight_checks`.
     *   **Justification:** Ensures the pre-modification validation step runs.
     *   **Result:** [ ] Pass / [ ] Fail
-*   **Step 3.2:** Verify checks for Instance State, NACL perms, Termination Protection perms, IAM Role perms, EBS perms.
-    *   **Justification:** Confirms the script attempts to validate readiness for subsequent actions using non-mutating calls.
+*   **Step 3.2:** Verify checks for Instance State, Security Group perms (create, modify attribute, revoke egress), Termination Protection perms, IAM Role perms, EBS perms.
+    *   **Justification:** Confirms the script attempts to validate readiness for subsequent actions using non-mutating calls/DryRuns.
     *   **Result:** [ ] Pass / [ ] Fail
 *   **Step 3.3:** Test scenario with pre-flight check warnings (e.g., instance stopping). Confirm user prompt to continue. Answer 'yes'.
     *   **Justification:** Validates handling of non-critical issues found during pre-flight.
@@ -91,8 +91,8 @@ Objective: Verify preliminary checks for permissions and resource states before 
 **Stage 4: Core Containment Actions**
 Objective: Verify network isolation and instance protection steps.
 
-*   **Step 4.1:** Verify NACL Containment (`apply_nacl_containment`). Check NACL creation, IPv4/IPv6 DENY rules, and subnet association.
-    *   **Justification:** Confirms the primary network isolation mechanism is applied correctly. Requires AWS Console verification.
+*   **Step 4.1:** Verify Security Group Containment (`apply_sg_containment`). Check SG creation (or reuse), default egress rule removal, and exclusive association with the target instance.
+    *   **Justification:** Confirms the primary network isolation mechanism (instance-level SG) is applied correctly. Requires AWS Console verification.
     *   **Result:** [ ] Pass / [ ] Fail
 *   **Step 4.2:** Verify Termination Protection enablement (`enable_termination_protection`). Check instance attribute.
     *   **Justification:** Confirms the instance is protected from accidental deletion. Requires AWS Console verification.
