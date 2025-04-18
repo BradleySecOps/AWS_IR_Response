@@ -1,6 +1,7 @@
 # AWS EC2 Instance Containment Script
 
 **Author:** Bradley Carpenter
+
 **Purpose:** To rapidly contain a potentially compromised EC2 instance within an AWS environment by isolating it, preserving evidence, and preventing further unauthorized actions.
 
 **🛑 EXTREME CAUTION ADVISED 🛑**
