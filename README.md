@@ -2,16 +2,22 @@
 
 **Author:** Bradley Carpenter
 
-**Purpose:** To rapidly contain a potentially compromised EC2 instance within an AWS environment by isolating it, preserving evidence, and preventing further unauthorized actions.
+**Acknowledgments:** This project was built by myself with  help from tools like Gemini and Roo Code. Used for code snippets and structure. I manually reviewed, adapted, tested, architected logic and integrated everything to meet the project goals and security standards.
 
-**🛑 EXTREME CAUTION ADVISED 🛑**
+**Purpose:** To rapidly contain a potentially compromised EC2 instance within an AWS environment by isolating it, preserving evidence,and preventing further unauthorized actions.
 
-**Disclaimer:** This script performs significant, potentially disruptive actions on your AWS environment, including modifying Network ACLs, Instance Attributes, IAM Roles, and Instance State. **It is intended SOLELY for use by experienced AWS practitioners and Incident Responders during active security incidents.**
+**CAUTION ADVISED** 
 
-*   **DO NOT run this script unless you are authorized, understand its full impact, and have tested it in a non-production environment.**
+**Disclaimer:** This script performs alterations to your AWS environment, including modifying Network ACLs, Instance Attributes, IAM Roles, and Instance State.
+
+*   **DO NOT run this script unless you have tested this within a non-production enviroment and understand the changes that will be made.**
 *   **Incorrect use can lead to loss of connectivity, data inaccessibility (if cleanup is improper), or interference with legitimate operations.**
-*   **Always prioritize following your organization's established and tested Incident Response procedures.** This script should be considered a potential tool within that framework, not a replacement for it.
-*   The author assumes **NO LIABILITY** for any damages or disruptions caused by the use or misuse of this script. **USE AT YOUR OWN RISK.**
+*   **Always prioritize following your organization's established and tested Incident Response procedures.** This script is a very powerful tool, I would highly recommend testing this tool first before deploying and using. Please see the test plan where I have outlined all testing that has been done to check every flow works. If any flows do not work please reach out with the errors(s) and I will look at altering/improving. 
+*   The author assumes **NO LIABILITY** for any damages or disruptions caused by the use or misuse of this script.
+
+I have put mutliple error checks, pre checks (of permissions) that occur prior to running any commands. I have additionally presented below every issue below that could affect this not running (that I could think of). Please always check and understand this prior to running this script for an incident. 
+
+If you do find any issues with the logic or flow of this script, please let me know and happy to discuss or change.
 
 ## Containment Strategy & Steps
 
