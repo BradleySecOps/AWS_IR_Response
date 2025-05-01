@@ -1,7 +1,6 @@
 # AWS EC2 Instance Containment Script
-
-**Author:** Bradley Carpenter
 ![Auth Page](./Screenshots/Auth_Page.png)
+**Author:** Bradley Carpenter
 **Purpose:** To rapidly contain a potentially compromised EC2 instance within an AWS environment by isolating it, preserving evidence and preventing further unauthorized actions.
 
 **CAUTION ADVISED**
@@ -43,15 +42,15 @@ The script employs a multi-optioned strategy to contain a potentially compromise
 1.  **Credential Input, Validation & Account Confirmation:**
     *   **Action:** Prompts for temporary AWS credentials. Uses `getpass` to hide sensitive input. Authenticates using `sts:GetCallerIdentity`, displays the AWS Account ID and attempts to display the Account Alias (`iam:ListAccountAliases`). **Crucially, it then prompts the user to confirm (`yes/no`) if the identified account is the correct target before proceeding.** Performs basic checks for essential EC2 and IAM read permissions that will be used as part of the script.
     *   **Rationale:** Ensures the script authenticates correctly and targets the intended AWS account, preventing accidental actions in the wrong environment. Displaying the alias adds mental confirmation to the Incident Responder they are working in the correct AWS Account. Basic permission checks provide early feedback. Temporary credentials limit exposure.
-
+![EC2 Check](./Screenshots/ec2_check.png)
 2.  **Instance Identification:**
     *   **Action:** Lists running or stopped EC2 instances in the specified region (`ec2:DescribeInstances`). Prompts the user to select the target instance ID. Gathers essential details like VPC ID and the instance's current Security Groups from the selected instance's metadata.
     *   **Rationale:** Accurately identifies the instance to be contained based on user input. VPC ID is crucial for creating the isolation Security Group. Knowing original SGs is needed for cleanup.
-
+![Pre Flight EC2 Checks](./Screenshots/Pre_Flight_ec2_checks.png)
 3.  **Pre-flight Checks:**
     *   **Action:** Before modifying resources, the script performs several non-mutating checks (doesn't change the environment) using `describe` or `list` API calls, including DryRun attempts where possible. It verifies the instance state, basic permissions for Security Group changes (`ec2:CreateSecurityGroup`, `ec2:ModifyInstanceAttribute`, `ec2:RevokeSecurityGroupEgress`), termination protection modification, IAM role policy listing/application, EBS volume description/snapshotting, and instance stopping.
     *   **Rationale:** This step aims to identify potential permission issues or problematic resource states *before* attempting irreversible actions, reducing the chance of mid-script failures. If critical checks fail, the script exits. If warnings are found, the user is prompted whether to continue.
-
+![EC2 Lockdown Execution](./Screenshots/ec2_lockdown_exec.png)
 4.  **Network Isolation (Security Group Containment):**
     *   **Action:**
         *   Checks if a dedicated "Containment Security Group" already exists in the instance's VPC (`ec2:DescribeSecurityGroups`).
@@ -67,7 +66,7 @@ The script employs a multi-optioned strategy to contain a potentially compromise
 6.  **Situational Awareness (Information Gathering):**
     *   **Action:** Checks if the instance belongs to an Auto Scaling Group (`autoscaling:DescribeAutoScalingInstances`) or is registered with Load Balancers (Classic: `elasticloadbalancing:DescribeLoadBalancers`; ALB/NLB: `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth`).
     *   **Rationale:** Provides context. If part of an ASG or behind an LB, containment actions (like stopping the instance or network isolation via SG) might trigger health check failures, potentially leading the ASG/LB to replace the instance. This awareness helps anticipate such behavior.
-
+![EC2 Role Revoke](./Screenshots/ec2_role_Revoke.png)
 7.  **IAM Role Assessment:**
     *   **Action:**
         *   Identifies the IAM Instance Profile attached to the instance (`ec2:DescribeInstances` data).
@@ -81,12 +80,13 @@ The script employs a multi-optioned strategy to contain a potentially compromise
         *   Finding other instances with the same role identifies potential blast radius or lateral movement if the role credentials were compromised.
         *   Listing permissions reveals what actions an attacker *could* have performed with the stolen credentials.
 
+![Revoke EC2 Role](./Screenshots/revoke_ec2_Role.png)
 8.  **Revoke Active IAM Role Sessions:**
     *   **Action:** Prompts the user to attach (or overwrite) a DENY ALL inline policy to the identified IAM Role (`iam:PutRolePolicy`).
     *   **Rationale:** If the instance's IAM credentials were compromised, this step invalidates those credentials *immediately*. The DENY ALL policy prevents the stolen credentials from being used to perform any further actions in the AWS account, effectively stopping ongoing misuse of that specific role. This is a crucial step to prevent further damage.
 
     Do note, any other instances that are using this role will also not work until you remove the inline policy.
-
+![EBS Snapshot Save](./Screenshots/ebs_snapshot_save.png)
 9.  **Preserve Evidence (EBS Snapshots):**
     *   **Action:**
         *   Identifies EBS volumes attached to the instance (`ec2:DescribeInstances` data).
@@ -98,11 +98,11 @@ The script employs a multi-optioned strategy to contain a potentially compromise
 10. **Check SSM Agent Status:**
     *   **Action:** Checks the status of the SSM Agent on the target instance (`ssm:DescribeInstanceInformation`).
     *   **Rationale:** Provides context on whether SSM might be usable for later, more detailed investigation or remediation actions *before* the instance is stopped (which would likely sever SSM connectivity).
-
+![EC2 Shutdown](./Screenshots/ec2_shutdown.png)
 11. **Stop Instance Execution:**
     *   **Action:** Checks the current instance state (`ec2:DescribeInstanceStatus`). If running or pending, prompts the user to stop the instance (`ec2:StopInstances`). Waits for the instance to reach the 'stopped' state.
     *   **Rationale:** Stopping the instance halts all processes running on it, preventing any further malicious activity originating *from* the instance (like C2 callbacks, data processing, attacks on other systems). It also helps reduce costs if the instance was compromised for resource abuse (e.g., crypto mining).
-
+![Containment End](./Screenshots/Containment_End.png)
 12. **Log Collection & Upload (Optional):**
     *   **Action:** Prompts the user whether to attempt log collection. If confirmed:
         *   Creates a uniquely named S3 bucket (`s3:CreateBucket`, `s3:HeadBucket`).
@@ -313,7 +313,7 @@ Follow these steps to run the containment script directly against an existing EC
 If you want to test the script in a controlled environment without using existing instances, a basic Terraform configuration is provided in the `terraform/` directory.
 
 **What the Terraform Code Deploys:**
-
+![Terraform Creation](./Screenshots/Terraform_Creation.png)
 *   A new **VPC** with a public subnet.
 *   An **Internet Gateway** and **Route Table** for basic internet connectivity to the subnet.
 *   A **Security Group** allowing inbound SSH (port 22) from anywhere (0.0.0.0/0) - **Note:** This is for testing convenience; restrict this in production.
