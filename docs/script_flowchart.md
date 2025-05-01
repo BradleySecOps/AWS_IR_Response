@@ -1,3 +1,21 @@
+Explanation of the Flowchart:
+
+Start & Setup: Initializes logging, gets credentials, sets up the AWS session. Exits if basic setup fails.
+Validation & Target: Validates credentials, confirms the target AWS account, lists instances, and prompts for selection. Exits if validation fails, account is denied, or no instances are found.
+Pre-flight: Gathers initial info (role, volumes) and runs checks. Exits if critical checks fail or if the user declines to proceed after warnings.
+Containment Actions (Subgraph): Executes the core steps sequentially:
+Security Group application
+Termination protection
+Context checks (ASG, LB, IMDS)
+Role-specific actions (find similar, get perms, offer revoke) - skipped if no role.
+EBS actions (get size, offer snapshot)
+SSM Agent status check
+Offer to stop instance
+Log Collection: Optionally attempts to collect CloudWatch logs and the action summary, package them, and upload to S3.
+Completion: Prints the final summary and cleanup reminders.
+End: Script finishes.
+
+```mermaid
 graph TD
     A[Start Script] --> B(Setup Logging);
     B --> C{Get AWS Credentials};

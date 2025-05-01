@@ -1,46 +1,34 @@
 # --- Provider Configuration ---
-# Configure the AWS Provider.
-# It's recommended to configure your AWS credentials using environment variables
-# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN [optional])
-# or an AWS credentials file (~/.aws/credentials).
 provider "aws" {
-  region = var.aws_region # Specify the desired AWS region
+  region = var.aws_region
 }
 
 # --- Variables ---
 variable "aws_region" {
   description = "The AWS region to deploy resources in."
   type        = string
-  default     = "us-east-1" # Change this to your preferred region if needed
+  default     = "us-east-1"
 }
 
 variable "instance_type" {
   description = "The EC2 instance type to use."
   type        = string
-  default     = "t3.micro" # A cost-effective, general-purpose instance type
+  default     = "t3.micro"
+}
+
+variable "vpc_cidr_block" {
+  description = "CIDR block for the VPC."
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "subnet_cidr_block" {
+  description = "CIDR block for the public subnet."
+  type        = string
+  default     = "10.0.1.0/24"
 }
 
 # --- Data Sources ---
-# Get the default VPC in the specified region.
-data "aws_vpc" "default" {
-  default = true
-}
-
-# Get all availability zones in the region.
-data "aws_availability_zones" "available" {}
-
-# Get a list of default subnets in the default VPC.
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-  filter {
-    name   = "default-for-az"
-    values = ["true"]
-  }
-}
-
 # Find the latest Amazon Linux 2 AMI.
 data "aws_ami" "amazon_linux_2" {
   most_recent = true
@@ -57,8 +45,65 @@ data "aws_ami" "amazon_linux_2" {
   }
 }
 
+# --- Network Resources ---
+# Create a dedicated VPC for the test environment
+resource "aws_vpc" "test_vpc" {
+  cidr_block = var.vpc_cidr_block
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name    = "Test-Containment-VPC"
+    Purpose = "Testing EC2 Containment Script"
+  }
+}
+
+# Create a public subnet within the VPC
+resource "aws_subnet" "test_public_subnet" {
+  vpc_id     = aws_vpc.test_vpc.id
+  cidr_block = var.subnet_cidr_block
+  availability_zone = "${var.aws_region}a" # Use the 'a' AZ for simplicity
+  map_public_ip_on_launch = true # Ensure instances get public IPs
+
+  tags = {
+    Name    = "Test-Containment-Public-Subnet"
+    Purpose = "Testing EC2 Containment Script"
+  }
+}
+
+# Create an Internet Gateway for the VPC
+resource "aws_internet_gateway" "test_igw" {
+  vpc_id = aws_vpc.test_vpc.id
+
+  tags = {
+    Name    = "Test-Containment-IGW"
+    Purpose = "Testing EC2 Containment Script"
+  }
+}
+
+# Create a Route Table for the public subnet
+resource "aws_route_table" "test_public_rt" {
+  vpc_id = aws_vpc.test_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.test_igw.id
+  }
+
+  tags = {
+    Name    = "Test-Containment-Public-RT"
+    Purpose = "Testing EC2 Containment Script"
+  }
+}
+
+# Associate the Route Table with the public subnet
+resource "aws_route_table_association" "test_public_assoc" {
+  subnet_id      = aws_subnet.test_public_subnet.id
+  route_table_id = aws_route_table.test_public_rt.id
+}
+
+
 # --- IAM Role and Policy ---
-# Create an IAM role that EC2 instances can assume.
 resource "aws_iam_role" "instance_role" {
   name = "test-containment-instance-role"
 
@@ -80,13 +125,11 @@ resource "aws_iam_role" "instance_role" {
   }
 }
 
-# Attach a read-only S3 policy to the role for testing purposes.
 resource "aws_iam_role_policy_attachment" "s3_read_only" {
   role       = aws_iam_role.instance_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess" # Example policy
 }
 
-# Create an instance profile to attach the role to EC2 instances.
 resource "aws_iam_instance_profile" "instance_profile" {
   name = "test-containment-instance-profile"
   role = aws_iam_role.instance_role.name
@@ -94,15 +137,14 @@ resource "aws_iam_instance_profile" "instance_profile" {
   tags = {
     Purpose = "Testing EC2 Containment Script"
   }
-} # <--- Added the missing closing brace here
+}
 
 # --- Security Group ---
-# Create a security group allowing SSH access (Port 22).
-# Note: Your script will apply a NACL, effectively overriding this for network traffic.
+# Updated to use the new VPC
 resource "aws_security_group" "instance_sg" {
   name        = "test-containment-sg"
   description = "Allow SSH inbound traffic"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = aws_vpc.test_vpc.id # Use the new VPC ID
 
   ingress {
     from_port   = 22
@@ -125,7 +167,8 @@ resource "aws_security_group" "instance_sg" {
   }
 }
 
-# --- Launch Template (Modern approach instead of Launch Configuration) ---
+# --- Launch Template ---
+# Updated to reference the SG in the new VPC
 resource "aws_launch_template" "test_lt" {
   name_prefix   = "test-containment-lt-"
   image_id      = data.aws_ami.amazon_linux_2.id
@@ -135,10 +178,9 @@ resource "aws_launch_template" "test_lt" {
     name = aws_iam_instance_profile.instance_profile.name
   }
 
-  network_interfaces {
-    associate_public_ip_address = true # Assign a public IP for easier initial access if needed
-    security_groups             = [aws_security_group.instance_sg.id]
-  }
+  # Network interface configured within the ASG via subnet selection
+  # Security group is associated here
+  vpc_security_group_ids = [aws_security_group.instance_sg.id]
 
   # Enable IMDSv2 (more secure) by default for testing
   metadata_options {
@@ -170,12 +212,11 @@ resource "aws_launch_template" "test_lt" {
 
 
 # --- Auto Scaling Group ---
-# Create an Auto Scaling Group to manage the EC2 instance.
-# This helps test the ASG detection part of your script.
+# Updated to use the new subnet ID
 resource "aws_autoscaling_group" "test_asg" {
   name_prefix = "test-containment-asg-"
-  # Use available default subnets across multiple AZs for resilience (though only 1 instance needed)
-  vpc_zone_identifier = data.aws_subnets.default.ids
+  # Use the specific subnet created in our VPC
+  vpc_zone_identifier = [aws_subnet.test_public_subnet.id]
 
   desired_capacity = 1
   min_size         = 1
@@ -183,25 +224,20 @@ resource "aws_autoscaling_group" "test_asg" {
 
   launch_template {
     id      = aws_launch_template.test_lt.id
-    version = "$Latest" # Always use the latest version of the launch template
+    version = "$Latest"
   }
 
-  # --- CORRECTED TAGS SECTION ---
-  # Define tags using individual tag blocks
   tag {
     key                 = "Name"
     value               = "Test-Containment-ASG"
-    propagate_at_launch = true # Propagate this tag to instances
+    propagate_at_launch = true
   }
   tag {
     key                 = "Purpose"
     value               = "Testing EC2 Containment Script"
     propagate_at_launch = true
   }
-  # --- END CORRECTED TAGS SECTION ---
 
-
-  # Wait for the specified capacity before considering creation complete
   wait_for_capacity_timeout = "5m"
 
   lifecycle {
@@ -209,7 +245,7 @@ resource "aws_autoscaling_group" "test_asg" {
   }
 }
 
-# --- Outputs (Optional) ---
+# --- Outputs ---
 output "instance_role_name" {
   description = "The name of the IAM role created for the instance."
   value       = aws_iam_role.instance_role.name
@@ -223,4 +259,25 @@ output "asg_name" {
 output "security_group_id" {
   description = "The ID of the security group created."
   value       = aws_security_group.instance_sg.id
+}
+
+output "vpc_id" {
+  description = "The ID of the VPC created."
+  value       = aws_vpc.test_vpc.id
+}
+
+output "subnet_id" {
+  description = "The ID of the public subnet created."
+  value       = aws_subnet.test_public_subnet.id
+}
+
+# Output the instance ID after the ASG creates it (requires waiting)
+# Note: This requires the ASG to successfully launch an instance.
+# We can get the instance ID from the ASG's instances attribute after apply.
+# However, directly outputting it isn't straightforward as it's dynamic.
+# The user will need to find the instance ID via the ASG name or tags after apply.
+
+output "test_instance_instructions" {
+  description = "Instructions to find the test instance ID."
+  value       = "After apply completes, find the instance ID associated with the ASG '${aws_autoscaling_group.test_asg.name}' or tagged with Name='Test-Containment-Instance'."
 }

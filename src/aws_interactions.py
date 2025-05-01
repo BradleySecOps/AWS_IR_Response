@@ -968,9 +968,17 @@ def stop_instance(ec2_client, instance_id):
                 print_status(action, "complete", success_msg)
                 logging.info(success_msg)
             except WaiterError as e:
-                error_msg = f"Error or timeout waiting for instance {instance_id} to stop: {e}. Please verify state manually."
-                print_status(action, "error", error_msg)
-                logging.error(error_msg, exc_info=True)
+                # Check if the waiter failed because the instance terminated instead of stopping
+                if "terminal failure state" in str(e) and "matched expected path: \"terminated\"" in str(e):
+                    success_msg = f"Instance {instance_id} terminated instead of stopping. Execution halted."
+                    print(Fore.GREEN + f"  └── {success_msg}")
+                    print_status(action, "complete", success_msg) # Treat termination as successful halt
+                    logging.info(success_msg)
+                else:
+                    # Handle other waiter errors (e.g., timeout)
+                    error_msg = f"Error or timeout waiting for instance {instance_id} to stop: {e}. Please verify state manually."
+                    print_status(action, "error", error_msg)
+                    logging.error(error_msg, exc_info=True)
             except Exception as e_wait:
                  error_msg = f"An unexpected error occurred waiting for instance stop: {e_wait}"
                  print_status(action, "error", error_msg)

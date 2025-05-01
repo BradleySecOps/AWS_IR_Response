@@ -2,9 +2,7 @@
 
 **Author:** Bradley Carpenter
 
-**Acknowledgments:** This project was built by myself with  help from tools like Gemini and Roo Code. Used for code snippets and structure. I manually reviewed, adapted, tested, architected logic and integrated everything to meet the project goals and security standards.
-
-**Purpose:** To rapidly contain a potentially compromised EC2 instance within an AWS environment by isolating it, preserving evidence,and preventing further unauthorized actions.
+**Purpose:** To rapidly contain a potentially compromised EC2 instance within an AWS environment by isolating it, preserving evidence and preventing further unauthorized actions.
 
 **CAUTION ADVISED**
 
@@ -18,6 +16,11 @@
 I have put mutliple error checks, pre checks (of permissions) that occur prior to running any commands. I have additionally presented below every issue below that could affect this not running (that I could think of). Please always check and understand this prior to running this script for an incident.
 
 If you do find any issues with the logic or flow of this script, please let me know and happy to discuss or change.
+
+Things to finalize :
+
+- Finalize test plan to confirm all outputs
+- Might look at automatic pulling of logs directly from EC2 instance
 
 ## Table of Contents
 
@@ -378,7 +381,86 @@ After the incident is resolved and forensic analysis is complete, **manual clean
 4.  **Review/Delete Snapshots:** Manage or delete the created EBS snapshots according to your organization's data retention and incident handling policies.
 5.  **Review/Delete Log Bucket:** If log collection was performed, review the logs in the generated S3 bucket (name logged in output). Delete the bucket and its contents when no longer needed.
 
+
+Explanation of the Flowchart:
+
+Start & Setup: Initializes logging, gets credentials, sets up the AWS session. Exits if basic setup fails.
+Validation & Target: Validates credentials, confirms the target AWS account, lists instances, and prompts for selection. Exits if validation fails, account is denied, or no instances are found.
+Pre-flight: Gathers initial info (role, volumes) and runs checks. Exits if critical checks fail or if the user declines to proceed after warnings.
+Containment Actions (Subgraph): Executes the core steps sequentially:
+Security Group application
+Termination protection
+Context checks (ASG, LB, IMDS)
+Role-specific actions (find similar, get perms, offer revoke) - skipped if no role.
+EBS actions (get size, offer snapshot)
+SSM Agent status check
+Offer to stop instance
+Log Collection: Optionally attempts to collect CloudWatch logs and the action summary, package them, and upload to S3.
+Completion: Prints the final summary and cleanup reminders.
+End: Script finishes.
+
+```mermaid
+graph TD
+    A[Start Script] --> B(Setup Logging);
+    B --> C{Get AWS Credentials};
+    C --> D{Initialize Boto3 Session};
+    D -- Success --> E{Validate Credentials & Confirm Account};
+    D -- Failure --> Exit_InitFail([Exit Script - Init Failure]);
+    E -- Account Confirmed & Validation OK --> F{List EC2 Instances};
+    E -- Account Denied / Critical Perms Missing --> Exit_ValidationFail([Exit Script - Validation Failure]);
+    F -- Instances Found --> G{Select Target Instance};
+    F -- No Instances Found --> Exit_NoInstances([Exit Script - No Instances]);
+    G -- Instance Selected --> H{Gather Preliminary Info - Role & Volumes};
+    G -- User Cancels --> Exit_UserCancel([Exit Script - User Cancelled]);
+    H --> I{Perform Pre-flight Checks};
+    I -- Critical Failure --> Exit_PreflightFail([Exit Script - Pre-flight Failed]);
+    I -- Warnings Found --> J{Continue Despite Warnings?};
+    I -- Success --> K(Execute Containment Actions);
+    J -- No --> Exit_PreflightWarn([Exit Script - User Declined Warnings]);
+    J -- Yes --> K;
+
+    subgraph Containment Actions
+        K --> L{Apply Security Group Containment};
+        L --> M{Enable Termination Protection};
+        M --> N{Check ASG Membership};
+        N --> O{Check Load Balancer Membership};
+        O --> P{Check IMDS Version};
+        P --> Q{Role-Specific Actions?};
+        Q -- Role Exists --> R{Find Instances w/ Same Role};
+        Q -- No Role --> V(Skip Role Actions);
+        R --> S{Get Role Permissions};
+        S --> T{Offer/Revoke Role Sessions?};
+        T -- User Confirms Yes --> U(Apply Deny Policy);
+        T -- User Confirms No / Skipped --> V;
+        U --> V;
+        V --> W{Get EBS Volume Sizes};
+        W --> X{Offer/Snapshot EBS Volumes?};
+        X -- User Confirms Yes --> Y(Create/Wait Snapshots);
+        X -- User Confirms No / Skipped --> Z(Continue after Snapshots);
+        Y --> Z;
+        Z --> AA{Check SSM Agent Status};
+        AA --> BB{Offer/Stop Instance?};
+        BB -- User Confirms Yes --> CC(Stop Instance & Wait);
+        BB -- User Confirms No / Skipped --> DD(Continue after Stop Instance);
+        CC --> DD;
+    end
+
+    DD --> EE{Offer Log Collection?};
+    EE -- User Confirms Yes --> FF{Collect Logs & Action Summary};
+    EE -- User Confirms No / Skipped --> GG(Print Completion Summary);
+    FF -- Success / Partial --> HH{Upload Logs/Summary to S3};
+    FF -- Failure --> GG;
+    HH --> GG;
+    GG --> End([End Script]);
+
+    %% Define Styles (Optional)
+    classDef exit fill:#f9f,stroke:#333,stroke-width:2px;
+    class Exit_InitFail,Exit_ValidationFail,Exit_NoInstances,Exit_UserCancel,Exit_PreflightFail,Exit_PreflightWarn exit;
+``` 
+
 **Always prioritize following your organization's specific incident response and cleanup procedures.**
+
+**Acknowledgments:** This project was built by myself with help from tools like Gemini and Roo Code. Used for code snippets and structure. I manually reviewed, adapted, tested, architected logic and integrated everything to meet the project goals and security standards.
 
 ## License
 
