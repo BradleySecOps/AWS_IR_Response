@@ -6,6 +6,7 @@
 **CAUTION ADVISED**
 
 **Disclaimer:** This script performs alterations to your AWS environment, including modifying Security Groups, Instance Attributes, IAM Roles, and Instance State.
+
 **Acknowledgments:** This project was built by myself with help from tools like Gemini and Roo Code. Used for code snippets and structure. I manually reviewed, adapted, tested, architected logic and integrated everything to meet the project goals and security standards.
 
 *   **DO NOT run this script unless you have tested this within a non-production enviroment and understand the changes that will be made.**
